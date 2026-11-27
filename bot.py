@@ -1,936 +1,976 @@
-# -*- coding: utf-8 -*-
-"""
-Telegram-бот: парсер username + рассылка сообщений с QR-авторизацией.
-Multi-user: у каждого пользователя бота — своя Telethon-сессия.
-"""
-
 import asyncio
-import io
 import logging
+import os
 import re
-import sqlite3
-import time
-from urllib.parse import urlparse
+import random
+from datetime import datetime
 
-import qrcode
-from telethon import TelegramClient, functions
-from telethon.sessions import StringSession
-from telethon.errors import (
-    FloodWaitError,
-    SessionPasswordNeededError,
-    UsernameNotOccupiedError,
-    UsernameInvalidError,
-    UserPrivacyRestrictedError,
-    UserIsBlockedError,
-    InputUserDeactivatedError,
-    PeerFloodError,
+import aiosqlite
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
 )
-from telethon.tl.types import User
-from telegram import Update, InputFile, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
-from telegram.request import HTTPXRequest
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
-# ============================================================
-# НАСТРОЙКИ — ВСТАВЬ СВОИ ЗНАЧЕНИЯ (ОБЯЗАТЕЛЬНО НОВЫЕ!)
-# ============================================================
+# ==================== CONFIG ====================
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+DB_PATH = "bot.db"
 
-BOT_TOKEN = "9266824511:AAFIRg8fvVMCL0wVQJH4e8SPJFBvs-_WpGE"
-API_ID = 37148893  # Вставь новый API_ID
-API_HASH = "951959306045b3fce3f68b12754b1aac"
-
-MESSAGE_LIMIT = 1500          
-MAX_USERNAMES = 500           
-MAX_COMMENTS_TOTAL = 3000     
-
-SEND_DELAY_SECONDS = 30       
-MAX_RECIPIENTS_PER_RUN = 200  
-
-DB_PATH = "sessions.db"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-log = logging.getLogger("tg_parser")
-
-processing_users = set()   
-active_mailings = {}       
+LOGIN_RE = re.compile(r"^[a-zA-Z0-9_]{3,20}$")
+PAGE_SIZE = 8
 
 
-# ============================================================
-# МЕНЕДЖЕР КЛИЕНТОВ
-# ============================================================
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
-class ClientManager:
-    def __init__(self, api_id, api_hash, db_path=DB_PATH):
-        self.api_id = api_id
-        self.api_hash = api_hash
-        self.db_path = db_path
-        self.active_clients = {}
-        self._init_db()
 
-    def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS sessions (
-                    user_id INTEGER PRIMARY KEY,
-                    session_string TEXT NOT NULL
-                )
-            """)
+# ==================== DATABASE ====================
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                tg_id      INTEGER PRIMARY KEY,
+                username   TEXT,
+                full_name  TEXT,
+                login      TEXT UNIQUE,
+                crystals   INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS wallets (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                network    TEXT NOT NULL,
+                address    TEXT NOT NULL,
+                added_by   INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS withdrawals (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                tg_id        INTEGER NOT NULL,
+                login        TEXT NOT NULL,
+                network      TEXT NOT NULL,
+                wallet       TEXT NOT NULL,
+                amount       INTEGER NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                processed_at TIMESTAMP
+            )
+        """)
+        await db.commit()
 
-    def load_session(self, user_id: int):
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT session_string FROM sessions WHERE user_id = ?", (user_id,)
-            ).fetchone()
+        async with db.execute("PRAGMA table_info(users)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        if "login" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN login TEXT")
+        if "crystals" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN crystals INTEGER NOT NULL DEFAULT 0")
+        await db.commit()
+
+
+async def get_user(tg_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def get_user_by_login(login: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT tg_id FROM users WHERE login = ?", (login,)) as cur:
+            row = await cur.fetchone()
             return row[0] if row else None
 
-    def save_session(self, user_id: int, session_string: str):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO sessions (user_id, session_string) VALUES (?, ?)",
-                (user_id, session_string),
-            )
 
-    def delete_session(self, user_id: int):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
-
-    async def get_client(self, user_id: int):
-        client = self.active_clients.get(user_id)
-        if client is not None:
-            try:
-                if client.is_connected() and await client.is_user_authorized():
-                    return client
-            except Exception:
-                log.debug("Клиент user_id=%s сломан, переподключаю", user_id)
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-            self.active_clients.pop(user_id, None)
-
-        session_str = self.load_session(user_id)
-        if not session_str:
-            return None
-
-        # Прокси убран
-        client = TelegramClient(StringSession(session_str), self.api_id, self.api_hash)
-        try:
-            await client.connect()
-        except Exception:
-            log.exception("Не удалось подключить клиента user_id=%s", user_id)
-            return None
-
-        if await client.is_user_authorized():
-            self.active_clients[user_id] = client
-            return client
-
-        await client.disconnect()
-        return None
-
-    async def add_new_client(self, user_id: int, client: TelegramClient):
-        self.active_clients[user_id] = client
-        self.save_session(user_id, client.session.save())
-
-    async def remove_client(self, user_id: int):
-        client = self.active_clients.pop(user_id, None)
-        if client:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-        self.delete_session(user_id)
-
-    async def disconnect_all(self):
-        for _uid, client in list(self.active_clients.items()):
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-        self.active_clients.clear()
+async def upsert_user(tg_id: int, username, full_name, login: str | None = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO users (tg_id, username, full_name, login)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(tg_id) DO UPDATE SET
+                username  = excluded.username,
+                full_name = excluded.full_name,
+                login     = COALESCE(users.login, excluded.login)
+        """, (tg_id, username, full_name, login))
+        await db.commit()
 
 
-# ============================================================
-# ПАРСИНГ ССЫЛОК И ПОЛУЧАТЕЛЕЙ
-# ============================================================
-
-def parse_public_link(value: str):
-    value = value.strip()
-    if value.startswith("@"):
-        return value[1:]
-
-    parsed = urlparse(value if "://" in value else "https://" + value)
-    if parsed.hostname not in ("t.me", "www.t.me", "telegram.me", "www.telegram.me"):
-        return None
-
-    parts = [p for p in parsed.path.split("/") if p]
-    if not parts:
-        return None
-    if parts[0].startswith("+") or parts[0] == "joinchat":
-        return None
-    if parts[0] in ("c", "s"):
-        return None
-
-    username = parts[0]
-    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
-        return None
-    return username
+async def add_crystals(tg_id: int, amount: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET crystals = crystals + ? WHERE tg_id = ?", (amount, tg_id))
+        await db.commit()
 
 
-def parse_recipients(raw_text: str):
-    cleaned = re.sub(r"https?://(?:www\.)?(?:t|telegram)\.(?:me|dog)/", "", raw_text)
-    parts = re.split(r"[\s,;]+", cleaned)
-    valid, invalid, seen = [], [], set()
-    for p in parts:
-        p = p.strip().lstrip("@")
-        if not p:
-            continue
-        if re.fullmatch(r"[A-Za-z0-9_]{5,32}", p):
-            key = p.lower()
-            if key not in seen:
-                seen.add(key)
-                valid.append(p)
-        else:
-            invalid.append(p)
-    return valid, invalid
+async def get_stats():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users WHERE login IS NOT NULL") as cur:
+            total = (await cur.fetchone())[0]
+        async with db.execute("SELECT COALESCE(SUM(crystals), 0) FROM users") as cur:
+            total_crystals = (await cur.fetchone())[0]
+    return {"total": total, "total_crystals": total_crystals}
 
 
-# ============================================================
-# ПАРСИНГ КАНАЛА/ГРУППЫ
-# ============================================================
+async def get_all_registered_ids() -> list[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT tg_id FROM users WHERE login IS NOT NULL AND crystals > 0") as cur:
+            return [r[0] for r in await cur.fetchall()]
 
-def add_sender_username(target: dict, sender, me_id):
-    if not sender:
+
+async def get_users_with_balance():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT tg_id, login, crystals FROM users WHERE crystals > 0 AND login IS NOT NULL") as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_clients_page(page: int):
+    offset = page * PAGE_SIZE
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT tg_id, login, crystals FROM users
+               WHERE login IS NOT NULL ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+            (PAGE_SIZE, offset),
+        ) as cur:
+            rows = [dict(r) for r in await cur.fetchall()]
+        async with db.execute("SELECT COUNT(*) FROM users WHERE login IS NOT NULL") as cur:
+            total = (await cur.fetchone())[0]
+    return rows, total
+
+
+async def add_wallet(network: str, address: str, admin_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO wallets (network, address, added_by) VALUES (?, ?, ?)", (network, address, admin_id))
+        await db.commit()
+
+
+async def get_wallets():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM wallets ORDER BY network, id") as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def delete_wallet(wallet_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM wallets WHERE id = ?", (wallet_id,))
+        await db.commit()
+
+
+async def get_networks() -> list[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT DISTINCT network FROM wallets ORDER BY network") as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+
+async def create_withdrawal(tg_id, login, network, wallet, amount) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO withdrawals (tg_id, login, network, wallet, amount) VALUES (?, ?, ?, ?, ?)",
+            (tg_id, login, network, wallet, amount),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_withdrawal(wid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM withdrawals WHERE id = ?", (wid,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def get_pending_withdrawals():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM withdrawals WHERE status = 'pending' ORDER BY id DESC") as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def finish_withdrawal(wid: int, status: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE withdrawals SET status = ?, processed_at = CURRENT_TIMESTAMP WHERE id = ?", (status, wid))
+        await db.commit()
+
+
+# ==================== KEYBOARDS ====================
+def client_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👤 Профиль", callback_data="client:profile"),
+            InlineKeyboardButton(text="💬 Поддержка", callback_data="client:support"),
+        ],
+        [
+            InlineKeyboardButton(text="💵 Пополнение", callback_data="client:deposit"),
+            InlineKeyboardButton(text="📤 Вывод",      callback_data="client:withdraw"),
+        ]
+    ])
+
+
+def admin_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats"),
+            InlineKeyboardButton(text="👥 Клиенты",    callback_data="admin:users:0"),
+        ],
+        [
+            InlineKeyboardButton(text="💼 Кошельки",   callback_data="admin:wallets"),
+            InlineKeyboardButton(text="📤 Заявки",     callback_data="admin:withdrawals"),
+        ],
+        [
+            InlineKeyboardButton(text="📢 Рассылка", callback_data="admin:broadcast"),
+            InlineKeyboardButton(text="📈 Отчет вручную", callback_data="admin:trading"),
+        ]
+    ])
+
+
+# Кнопки "Назад" для всех меню
+def back_to_admin_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ В админ-меню", callback_data="admin:menu")]
+    ])
+
+def back_to_client_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="client:menu")]
+    ])
+
+def back_to_clients_list_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К клиентам", callback_data="admin:users:0")],
+        [InlineKeyboardButton(text="⬅️ В админ-меню", callback_data="admin:menu")]
+    ])
+
+def back_to_wallets_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К кошелькам", callback_data="admin:wallets")],
+        [InlineKeyboardButton(text="⬅️ В админ-меню", callback_data="admin:menu")]
+    ])
+
+
+def clients_page_kb(rows, page, total) -> InlineKeyboardMarkup:
+    buttons = []
+    for r in rows:
+        buttons.append([InlineKeyboardButton(
+            text=f"{r['login']}  —  $ {r['crystals']}",
+            callback_data=f"admin:user:{r['tg_id']}",
+        )])
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin:users:{page-1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin:users:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="⬅️ В админ-меню", callback_data="admin:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def client_card_kb(tg_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💵 Начислить $", callback_data=f"admin:credit:{tg_id}")],
+        [InlineKeyboardButton(text="⬅️ К клиентам", callback_data="admin:users:0")],
+        [InlineKeyboardButton(text="⬅️ В админ-меню", callback_data="admin:menu")]
+    ])
+
+
+def networks_kb(networks: list[str]) -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(text=n, callback_data=f"wd:net:{n}")] for n in networks]
+    buttons.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="client:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def admin_wallets_kb(wallets: list[dict]) -> InlineKeyboardMarkup:
+    buttons = []
+    for w in wallets:
+        buttons.append([InlineKeyboardButton(
+            text=f"❌ {w['network']}: {w['address'][:18]}…",
+            callback_data=f"admin:wallet:del:{w['id']}",
+        )])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить кошелёк", callback_data="admin:wallet:add")])
+    buttons.append([InlineKeyboardButton(text="⬅️ В админ-меню", callback_data="admin:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def admin_withdrawals_kb(items: list[dict]) -> InlineKeyboardMarkup:
+    buttons = []
+    for w in items:
+        buttons.append([InlineKeyboardButton(
+            text=f"#{w['id']} {w['login']} — ${w['amount']} ({w['network']})",
+            callback_data=f"admin:wd:{w['id']}",
+        )])
+    buttons.append([InlineKeyboardButton(text="⬅️ В админ-меню", callback_data="admin:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def withdrawal_review_kb(wid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Принять",   callback_data=f"wd:accept:{wid}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"wd:reject:{wid}"),
+        ],
+        [InlineKeyboardButton(text="⬅️ К заявкам", callback_data="admin:withdrawals")],
+        [InlineKeyboardButton(text="⬅️ В админ-меню", callback_data="admin:menu")]
+    ])
+
+
+# ==================== FSM ====================
+class Registration(StatesGroup):
+    waiting_login = State()
+
+class CreditCrystals(StatesGroup):
+    waiting_amount = State()
+    waiting_notification = State()
+    confirm = State()
+
+class Broadcast(StatesGroup):
+    waiting_message = State()
+    confirm = State()
+
+class AddWallet(StatesGroup):
+    waiting_network = State()
+    waiting_address = State()
+
+class Withdraw(StatesGroup):
+    waiting_network = State()
+    waiting_wallet  = State()
+    waiting_amount  = State()
+    confirm         = State()
+
+
+# ==================== ROUTERS ====================
+common_router = Router()
+admin_router = Router()
+admin_router.message.filter(F.from_user.id.in_(ADMIN_IDS))
+admin_router.callback_query.filter(F.from_user.id.in_(ADMIN_IDS))
+client_router = Router()
+
+
+# ==================== РЕГИСТРАЦИЯ ====================
+@common_router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    user = await get_user(message.from_user.id)
+    if user is None or not user.get("login"):
+        await state.set_state(Registration.waiting_login)
+        await message.answer(
+            f"👋 Привет, <b>{message.from_user.first_name}</b>!\n\n"
+            "Придумай себе <b>логин</b> в боте.\n"
+            "Требования: 3–20 символов, латиница, цифры и <code>_</code>.\n"
+            "Пример: <code>ivan_2024</code>"
+        )
         return
-    if getattr(sender, "bot", False):
+
+    await upsert_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
+    await state.clear()
+    await message.answer(
+        f"👋 С возвращением, <b>{user['login']}</b>!\n"
+        f"💵 Баланс: <b>${user['crystals']}</b>\n\nВыбери действие:",
+        reply_markup=client_menu_kb(),
+    )
+    if is_admin(message.from_user.id):
+        await message.answer("🔑 Ты админ. Открой /admin")
+
+
+@common_router.message(Registration.waiting_login)
+async def reg_set_login(message: Message, state: FSMContext):
+    login = (message.text or "").strip()
+    if not LOGIN_RE.match(login):
+        await message.answer("❌ Логин должен быть 3–20 символов: латиница, цифры, <code>_</code>.\nПопробуй ещё раз:")
         return
-    sid = getattr(sender, "id", None)
-    if me_id is not None and sid == me_id:
+    if await get_user_by_login(login):
+        await message.answer("❌ Такой логин уже занят. Придумай другой:")
         return
-    username = getattr(sender, "username", None)
-    if username:
-        target[username.lower()] = "@" + username
+
+    await upsert_user(message.from_user.id, message.from_user.username, message.from_user.full_name, login=login)
+    await state.clear()
+    await message.answer(f"✅ Готово! Твой логин: <code>{login}</code>\n💵 Баланс: <b>$0</b>\n\nМеню:", reply_markup=client_menu_kb())
+    if is_admin(message.from_user.id):
+        await message.answer("🔑 Открой /admin")
 
 
-async def collect_from_chat(client, entity, progress_message):
-    found = {}
-    scanned_messages = 0
-    scanned_comments = 0
-    comment_groups_checked = set()
+# ==================== КЛИЕНТ ====================
+@client_router.callback_query(F.data == "client:profile")
+async def show_profile(call: CallbackQuery):
+    user = await get_user(call.from_user.id)
+    if not user or not user.get("login"):
+        await call.answer("Сначала пройди /start", show_alert=True)
+        return
+    text = f"👤 <b>Профиль</b>\n\nЛогин: <code>{user['login']}</code>\n💵 Баланс: <b>${user['crystals']}</b>\nID: <code>{user['tg_id']}</code>"
+    await call.message.edit_text(text, reply_markup=back_to_client_kb())
 
+
+@client_router.callback_query(F.data == "client:support")
+async def show_support(call: CallbackQuery):
+    await call.message.edit_text("💬 <b>Поддержка</b>\n\nНапиши нам: @tradingbot2027", reply_markup=back_to_client_kb())
+
+
+@client_router.callback_query(F.data == "client:menu")
+async def back_to_client_menu(call: CallbackQuery):
+    await call.message.edit_text("Выбери действие:", reply_markup=client_menu_kb())
+
+
+@client_router.callback_query(F.data == "client:deposit")
+async def show_deposit(call: CallbackQuery):
+    wallets = await get_wallets()
+    if not wallets:
+        await call.message.edit_text("💵 <b>Пополнение</b>\n\nПока реквизиты не настроены. Загляни позже.", reply_markup=back_to_client_kb())
+        return
+
+    by_net: dict[str, list[str]] = {}
+    for w in wallets:
+        by_net.setdefault(w["network"], []).append(w["address"])
+
+    lines = ["💵 <b>Пополнение</b>\n", "Переведи средства на один из кошельков ниже и напиши админу @tradingbot2027 с хешем транзакции:\n"]
+    for net, addrs in by_net.items():
+        lines.append(f"\n<b>{net}</b>")
+        for a in addrs:
+            lines.append(f"<code>{a}</code>")
+
+    await call.message.edit_text("\n".join(lines), reply_markup=back_to_client_kb(), disable_web_page_preview=True)
+
+
+@client_router.callback_query(F.data == "client:withdraw")
+async def withdraw_start(call: CallbackQuery, state: FSMContext):
+    user = await get_user(call.from_user.id)
+    if not user or not user.get("login"):
+        await call.answer("Сначала пройди /start", show_alert=True)
+        return
+    if user["crystals"] <= 0:
+        await call.answer("❌ Нечего выводить — баланс $0", show_alert=True)
+        return
+
+    networks = await get_networks()
+    if not networks:
+        await call.answer("Вывод временно недоступен", show_alert=True)
+        return
+
+    await state.set_state(Withdraw.waiting_network)
+    await call.message.edit_text(f"📤 <b>Вывод</b>\n\nБаланс: <b>${user['crystals']}</b>\n\nВыбери сеть:", reply_markup=networks_kb(networks))
+
+
+@client_router.callback_query(F.data.startswith("wd:net:"), Withdraw.waiting_network)
+async def withdraw_set_network(call: CallbackQuery, state: FSMContext):
+    network = call.data.split(":", 2)[2]
+    await state.update_data(network=network)
+    await state.set_state(Withdraw.waiting_wallet)
+    await call.message.edit_text(f"📤 <b>Вывод</b>\nСеть: <b>{network}</b>\n\nВведи <b>адрес своего кошелька</b>:\n\n/cancel — отмена")
+
+
+@client_router.message(Withdraw.waiting_wallet)
+async def withdraw_set_wallet(message: Message, state: FSMContext):
+    wallet = (message.text or "").strip()
+    if len(wallet) < 10 or len(wallet) > 200:
+        await message.answer("❌ Похоже на неправильный адрес. Попробуй снова:")
+        return
+
+    data = await state.get_data()
+    user = await get_user(message.from_user.id)
+    await state.update_data(wallet=wallet)
+    await state.set_state(Withdraw.waiting_amount)
+    await message.answer(f"📤 <b>Вывод</b>\nСеть: <b>{data['network']}</b>\nКошелёк: <code>{wallet}</code>\n\nСколько $ вывести? (доступно: <b>${user['crystals']}</b>)")
+
+
+@client_router.message(Withdraw.waiting_amount)
+async def withdraw_set_amount(message: Message, state: FSMContext):
     try:
-        me = await client.get_me()
-        me_id = me.id if me else None
-    except Exception:
-        me_id = None
+        amount = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("❌ Нужно целое число. Попробуй снова:")
+        return
 
-    async for message in client.iter_messages(entity, limit=MESSAGE_LIMIT):
-        scanned_messages += 1
+    user = await get_user(message.from_user.id)
+    if amount <= 0 or amount > user["crystals"]:
+        await message.answer(f"❌ Неверная сумма. У тебя: ${user['crystals']}")
+        return
 
-        try:
-            sender = await message.get_sender()
-            add_sender_username(found, sender, me_id)
-        except Exception:
-            log.debug("Не удалось получить автора сообщения %s", message.id, exc_info=True)
-
-        if getattr(message, "replies", None) and getattr(message.replies, "replies", 0):
-            if scanned_comments < MAX_COMMENTS_TOTAL:
-                try:
-                    discussion = await client(
-                        functions.messages.GetDiscussionMessageRequest(
-                            peer=entity,
-                            msg_id=message.id,
-                        )
-                    )
-
-                    discussion_chat = None
-                    for chat in discussion.chats:
-                        if getattr(chat, "megagroup", False) or getattr(chat, "gigagroup", False):
-                            discussion_chat = chat
-                            break
-
-                    if discussion_chat is not None:
-                        discussion_entity = await client.get_entity(discussion_chat)
-                        top_message = discussion.messages[0]
-
-                        key = (getattr(discussion_chat, "id", None), top_message.id)
-                        if key not in comment_groups_checked:
-                            comment_groups_checked.add(key)
-
-                            async for comment in client.iter_messages(
-                                discussion_entity,
-                                reply_to=top_message.id,
-                                limit=500,
-                            ):
-                                if scanned_comments >= MAX_COMMENTS_TOTAL:
-                                    break
-                                scanned_comments += 1
-                                try:
-                                    comment_sender = await comment.get_sender()
-                                    add_sender_username(found, comment_sender, me_id)
-                                except Exception:
-                                    log.debug(
-                                        "Не удалось получить автора комментария %s",
-                                        comment.id,
-                                        exc_info=True,
-                                    )
-
-                                if len(found) >= MAX_USERNAMES:
-                                    break
-
-                except FloodWaitError as error:
-                    await progress_message.edit_text(
-                        f"Telegram временно ограничил запросы. "
-                        f"Подожди {error.seconds} секунд и попробуй снова."
-                    )
-                    raise
-                except Exception:
-                    log.debug(
-                        "Не удалось прочитать комментарии к посту %s",
-                        message.id,
-                        exc_info=True,
-                    )
-
-        if len(found) >= MAX_USERNAMES or scanned_comments >= MAX_COMMENTS_TOTAL:
-            break
-
-        if scanned_messages % 100 == 0:
-            try:
-                await progress_message.edit_text(
-                    f"Проверено сообщений: {scanned_messages}\n"
-                    f"Комментариев: {scanned_comments}\n"
-                    f"Уникальных username: {len(found)}"
-                )
-            except Exception:
-                pass
-
-    return sorted(found.values(), key=str.casefold), scanned_messages, scanned_comments
-
-
-# ============================================================
-# ОБЩИЕ КОМАНДЫ
-# ============================================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "Привет! Я умею:\n"
-        "• собирать публичные @username авторов из каналов и групп;\n"
-        "• рассылать сообщение с твоего аккаунта по списку username.\n\n"
-        "Подключение:\n"
-        "1. /login — отсканируй QR (Настройки → Устройства → Подключить устройство).\n\n"
-        "Парсинг username:\n"
-        "2. Отправь ссылку на публичный канал/группу (например, https://t.me/channelname).\n"
-        "3. Получи файлы TXT и CSV со списком.\n\n"
-        "Рассылка:\n"
-        "4. /send → пришли текст → пришли список юзернеймов → /confirm.\n"
-        "   Сообщения уходят с твоего аккаунта с паузой "
-        f"{SEND_DELAY_SECONDS} сек между получателями.\n\n"
-        "Команды:\n"
-        "/login — подключить аккаунт\n"
-        "/logout — отключить аккаунт\n"
-        "/status — проверить авторизацию\n"
-        "/send — подготовить рассылку\n"
-        "/confirm — запустить рассылку\n"
-        "/stop — остановить рассылку\n"
-        "/cancel — отменить подготовку\n\n"
-        f"Лимиты: парсинг — до {MAX_USERNAMES} username, "
-        f"рассылка — до {MAX_RECIPIENTS_PER_RUN} за запуск."
+    data = await state.get_data()
+    await state.update_data(amount=amount)
+    await state.set_state(Withdraw.confirm)
+    await message.answer(
+        f"Проверь заявку:\n\n🌐 Сеть: <b>{data['network']}</b>\n👛 Кошелёк: <code>{data['wallet']}</code>\n💵 Сумма: <b>${amount}</b>\n\nОтправить админу?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Отправить", callback_data="wd:submit")],
+            [InlineKeyboardButton(text="❌ Отмена",   callback_data="wd:cancel")],
+        ]),
     )
 
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    manager: ClientManager = context.bot_data["client_manager"]
-    client = await manager.get_client(user_id)
-
-    if client:
-        try:
-            me = await client.get_me()
-            name = me.first_name or ""
-            username = f"@{me.username}" if me.username else "(без username)"
-            await update.message.reply_text(
-                f"✅ Аккаунт подключён: {name} {username}\n"
-                "Можешь отправлять ссылки или /send для рассылки."
-            )
-        except Exception:
-            await update.message.reply_text(
-                "⚠️ Сессия есть, но проверить её не удалось. "
-                "Попробуй /logout и /login заново."
-            )
-    else:
-        await update.message.reply_text("❌ Аккаунт не подключён. Отправь /login.")
+@client_router.callback_query(F.data == "wd:cancel", Withdraw.confirm)
+async def withdraw_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("Отменено.", reply_markup=client_menu_kb())
 
 
-async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    manager: ClientManager = context.bot_data["client_manager"]
+@client_router.callback_query(F.data == "wd:submit", Withdraw.confirm)
+async def withdraw_submit(call: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await state.clear()
 
-    state = active_mailings.get(user_id)
-    if state and not state["task"].done():
-        state["stop"] = True
+    user = await get_user(call.from_user.id)
+    wid = await create_withdrawal(user["tg_id"], user["login"], data["network"], data["wallet"], data["amount"])
 
-    await manager.remove_client(user_id)
-    await update.message.reply_text(
-        "✅ Сессия удалена. Аккаунт отключён. Можешь /login снова."
+    text = (
+        f"📤 <b>Новая заявка на вывод #{wid}</b>\n\n"
+        f"👤 Клиент: <code>{user['login']}</code> (id <code>{user['tg_id']}</code>)\n"
+        f"🌐 Сеть: <b>{data['network']}</b>\n"
+        f"👛 Кошелёк: <code>{data['wallet']}</code>\n"
+        f"💵 Сумма: <b>${data['amount']}</b>"
     )
-
-
-async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    manager: ClientManager = context.bot_data["client_manager"]
-
-    existing = await manager.get_client(user_id)
-    if existing:
-        await update.message.reply_text(
-            "Ты уже авторизован. Отправь ссылку на канал, /send для рассылки "
-            "или сначала /logout."
-        )
-        return
-
-    # Прокси убран
-    client = TelegramClient(StringSession(), manager.api_id, manager.api_hash)
-    try:
-        await client.connect()
-        qr_login = await client.qr_login()
-        url = qr_login.url
-
-        qr_img = qrcode.make(url)
-        buf = io.BytesIO()
-        qr_img.save(buf, format="PNG")
-        buf.seek(0)
-
-        sent_msg = await update.message.reply_photo(
-            photo=InputFile(buf, filename="qr.png"),
-            caption=(
-                "📱 Отсканируй QR-код в Telegram:\n"
-                "Настройки → Устройства → Подключить устройство.\n\n"
-                "Код действует около минуты."
-            ),
-        )
-
+    for admin_id in ADMIN_IDS:
         try:
-            await asyncio.wait_for(qr_login.wait(), timeout=120)
-        except SessionPasswordNeededError:
-            context.user_data["awaiting_2fa"] = client
-            await sent_msg.edit_caption(
-                "🔐 Аккаунт защищён паролем 2FA.\n"
-                "Напиши свой пароль следующим сообщением."
-            )
-            return
-        except asyncio.TimeoutError:
-            await sent_msg.edit_caption(
-                "⏱ Время ожидания истекло. Отправь /login ещё раз."
-            )
-            await client.disconnect()
-            return
-
-        await manager.add_new_client(user_id, client)
-        await sent_msg.edit_caption(
-            "✅ Аккаунт подключён! Теперь можешь отправлять ссылки на канал "
-            "или /send для рассылки."
-        )
-    except Exception:
-        log.exception("Ошибка при входе по QR")
-        try:
-            await client.disconnect()
+            await bot.send_message(admin_id, text)
         except Exception:
             pass
-        await update.message.reply_text("Не удалось войти. Попробуй /login ещё раз.")
+
+    await call.message.edit_text(f"✅ Заявка #{wid} отправлена админу.", reply_markup=client_menu_kb())
 
 
-async def handle_2fa_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    client: TelegramClient = context.user_data.get("awaiting_2fa")
-    if client is None:
+# ==================== АДМИН ====================
+@admin_router.message(Command("admin"))
+async def admin_panel(message: Message):
+    await message.answer("🛠 <b>Админ-панель</b>", reply_markup=admin_menu_kb())
+
+
+@admin_router.callback_query(F.data == "admin:menu")
+async def admin_menu_cb(call: CallbackQuery):
+    await call.message.edit_text("🛠 <b>Админ-панель</b>", reply_markup=admin_menu_kb())
+
+
+@admin_router.callback_query(F.data == "admin:stats")
+async def admin_stats(call: CallbackQuery):
+    stats = await get_stats()
+    await call.message.edit_text(f"📊 <b>Статистика</b>\n\n👥 Клиентов: <b>{stats['total']}</b>\n💵 Общий баланс: <b>${stats['total_crystals']}</b>", reply_markup=back_to_admin_kb())
+
+
+# -------- клиенты --------
+@admin_router.callback_query(F.data.startswith("admin:users:"))
+async def admin_users(call: CallbackQuery):
+    page = int(call.data.split(":")[2])
+    rows, total = await get_clients_page(page)
+    if not rows:
+        await call.message.edit_text("Пока нет зарегистрированных клиентов.", reply_markup=back_to_admin_kb())
+        return
+    await call.message.edit_text(f"👥 <b>Клиенты</b> ({total})\n\nВыбери клиента:", reply_markup=clients_page_kb(rows, page, total))
+
+
+@admin_router.callback_query(F.data.startswith("admin:user:"))
+async def admin_user_card(call: CallbackQuery):
+    tg_id = int(call.data.split(":")[2])
+    user = await get_user(tg_id)
+    if not user:
+        await call.answer("Клиент не найден", show_alert=True)
+        return
+    text = f"👤 <b>Карточка клиента</b>\n\nЛогин: <code>{user['login']}</code>\nИмя: {user['full_name']}\nID: <code>{user['tg_id']}</code>\n💵 Баланс: <b>${user['crystals']}</b>"
+    await call.message.edit_text(text, reply_markup=client_card_kb(tg_id))
+
+
+# -------- начисление --------
+@admin_router.callback_query(F.data.startswith("admin:credit:"))
+async def credit_start(call: CallbackQuery, state: FSMContext):
+    tg_id = int(call.data.split(":")[2])
+    user = await get_user(tg_id)
+    if not user:
+        await call.answer("Клиент не найден", show_alert=True)
+        return
+    await state.update_data(target_tg_id=tg_id, target_login=user["login"])
+    await state.set_state(CreditCrystals.waiting_amount)
+    await call.message.edit_text(
+        f"💵 <b>Начисление средств</b>\nКлиент: <code>{user['login']}</code>\n\nСколько начислить? Введи <b>целое число</b>.\nМожно отрицательное — тогда спишется.\n\n/cancel — отмена"
+    )
+
+
+@admin_router.message(CreditCrystals.waiting_amount)
+async def credit_amount(message: Message, state: FSMContext):
+    try:
+        amount = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("❌ Нужно целое число. Попробуй снова:")
+        return
+    if amount == 0:
+        await message.answer("❌ 0 не подходит. Введи другое число:")
         return
 
-    password = (update.message.text or "").strip()
-    user_id = update.effective_user.id
-    manager: ClientManager = context.bot_data["client_manager"]
+    await state.update_data(amount=amount)
+    await state.set_state(CreditCrystals.waiting_notification)
+    await message.answer(f"✍️ Введи текст уведомления, которое получит клиент.\nСумма: <b>${amount:+d}</b>\n\n/cancel — отмена")
+
+
+@admin_router.message(CreditCrystals.waiting_notification)
+async def credit_notification(message: Message, state: FSMContext):
+    notification = (message.text or "").strip()
+    if not notification:
+        await message.answer("❌ Пустое сообщение. Введи текст:")
+        return
+
+    data = await state.get_data()
+    await state.update_data(notification=notification)
+    await state.set_state(CreditCrystals.confirm)
+    await message.answer(
+        f"Проверь:\n\n👤 Клиент: <code>{data['target_login']}</code>\n💵 Сумма: <b>${data['amount']:+d}</b>\n📝 Уведомление:\n{notification}\n\nПодтвердить?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Начислить", callback_data="credit:go")],
+            [InlineKeyboardButton(text="❌ Отмена",    callback_data="credit:cancel")],
+        ]),
+    )
+
+
+@admin_router.callback_query(F.data == "credit:cancel", CreditCrystals.confirm)
+async def credit_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("Отменено.", reply_markup=back_to_admin_kb())
+
+
+@admin_router.callback_query(F.data == "credit:go", CreditCrystals.confirm)
+async def credit_go(call: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await state.clear()
+
+    tg_id = data["target_tg_id"]
+    amount = data["amount"]
+    notification = data["notification"]
+
+    await add_crystals(tg_id, amount)
+    user = await get_user(tg_id)
 
     try:
-        await update.message.delete()
+        await bot.send_message(
+            tg_id,
+            f"💵 <b>Изменение баланса</b>\n\nСумма: <b>${amount:+d}</b>\nТекущий баланс: <b>${user['crystals']}</b>\n\n{notification}",
+        )
+        delivered = True
+    except Exception:
+        delivered = False
+
+    await call.message.edit_text(
+        f"✅ Готово.\n\n👤 Клиент: <code>{data['target_login']}</code>\n💵 Сумма: <b>${amount:+d}</b>\n💰 Новый баланс: <b>${user['crystals']}</b>\n📩 Уведомление: {'доставлено ✅' if delivered else 'не доставлено ❌'}",
+        reply_markup=back_to_admin_kb(),
+    )
+
+
+# -------- рассылка --------
+@admin_router.callback_query(F.data == "admin:broadcast")
+async def broadcast_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(Broadcast.waiting_message)
+    await call.message.edit_text(
+        "📢 Отправь сообщение (текст) для рассылки.\nРассылка уйдет ТОЛЬКО клиентам с балансом больше $0.\nВ конец добавится актуальный баланс.\n\n/cancel — отмена",
+        reply_markup=back_to_admin_kb()
+    )
+
+
+@admin_router.message(Broadcast.waiting_message)
+async def broadcast_preview(message: Message, state: FSMContext):
+    await state.update_data(text=message.text or message.caption or "")
+    await state.set_state(Broadcast.confirm)
+    await message.answer(
+        f"✅ Отправить это сообщение всем активным клиентам?\n\nТекст:\n{message.text or message.caption}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Отправить", callback_data="broadcast:go")],
+            [InlineKeyboardButton(text="❌ Отмена",    callback_data="broadcast:cancel")],
+        ]),
+    )
+
+
+@admin_router.callback_query(F.data == "broadcast:cancel", Broadcast.confirm)
+async def broadcast_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("Отменено.", reply_markup=back_to_admin_kb())
+
+
+@admin_router.callback_query(F.data == "broadcast:go", Broadcast.confirm)
+async def broadcast_go(call: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await state.clear()
+    await call.message.edit_text("📤 Рассылка запущена…")
+
+    users = await get_all_registered_ids()
+    ok = fail = 0
+    base_text = data.get("text", "")
+    
+    for uid in users:
+        user = await get_user(uid)
+        if not user: continue
+        personal_text = f"{base_text}\n\n💰 <b>Ваш актуальный баланс:</b> <b>${user['crystals']}</b>"
+        try:
+            await bot.send_message(uid, personal_text)
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)
+
+    await call.message.answer(f"📢 Готово.\n✅ Доставлено: <b>{ok}</b>\n❌ Ошибок: <b>{fail}</b>", reply_markup=back_to_admin_kb())
+
+
+# -------- Трейдинг-отчет ВРУЧНУЮ --------
+@admin_router.callback_query(F.data == "admin:trading")
+async def trading_broadcast_start(call: CallbackQuery):
+    users = await get_users_with_balance()
+    if not users:
+        await call.answer("Нет клиентов с балансом > 0", show_alert=True)
+        return
+    
+    await call.message.edit_text(
+        f"📈 <b>Трейдинг-отчет (вручную)</b>\n\nБудет отправлен <b>{len(users)}</b> клиентам.\nБот рассчитает профит по стратегии скальпинга.\n\nЗапускаем?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Запустить рассылку", callback_data="trading:go")],
+            [InlineKeyboardButton(text="⬅️ В админ-меню", callback_data="admin:menu")],
+        ])
+    )
+
+
+@admin_router.callback_query(F.data == "trading:go")
+async def trading_broadcast_go(call: CallbackQuery, bot: Bot):
+    await call.message.edit_text("📤 Формируем и отправляем отчеты…")
+    users = await get_users_with_balance()
+    ok = fail = 0
+    
+    for u in users:
+        bal = u['crystals']
+        trade1 = round(bal * 0.018, 2)
+        trade2 = round(bal * 0.022, 2)
+        trade3 = round(bal * 0.015, 2)
+        total_profit = round(trade1 + trade2 + trade3, 2)
+        
+        text = (
+            f"🚀 <b>Наш торговый бот начал торговлю на фьючерсах!</b>\n\n"
+            f"Мы используем стратегию <b>скальпинга</b>.\n\n"
+            f"📊 <b>Статистика за сегодня по вашему депозиту (${bal}):</b>\n"
+            f"🔹 Сделка 1 (BTC/USDT Long): <b>+${trade1}</b>\n"
+            f"🔹 Сделка 2 (ETH/USDT Short): <b>+${trade2}</b>\n"
+            f"🔹 Сделка 3 (SOL/USDT Long): <b>+${trade3}</b>\n\n"
+            f"💰 <b>Итого заработано за день: +${total_profit}</b>\n\n"
+            f"💵 <b>Ваш текущий баланс:</b> <b>${bal}</b>"
+        )
+        try:
+            await bot.send_message(u['tg_id'], text)
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)
+
+    await call.message.answer(f"📈 Готово.\n✅ Доставлено: <b>{ok}</b>\n❌ Ошибок: <b>{fail}</b>", reply_markup=back_to_admin_kb())
+
+
+# -------- кошельки --------
+@admin_router.callback_query(F.data == "admin:wallets")
+async def admin_wallets(call: CallbackQuery):
+    wallets = await get_wallets()
+    if not wallets:
+        await call.message.edit_text("💼 <b>Кошельки</b>\n\nПока пусто. Добавь первый:", reply_markup=admin_wallets_kb([]))
+        return
+    await call.message.edit_text(f"💼 <b>Кошельки</b> ({len(wallets)})\n\nТап по кошельку — удалить.", reply_markup=admin_wallets_kb(wallets))
+
+
+@admin_router.callback_query(F.data == "admin:wallet:add")
+async def wallet_add_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AddWallet.waiting_network)
+    await call.message.edit_text("🌐 Введи название сети/валюты (например: <code>BTC</code>, <code>USDT (TRC20)</code>):\n\n/cancel — отмена", reply_markup=back_to_wallets_kb())
+
+
+@admin_router.message(AddWallet.waiting_network)
+async def wallet_add_network(message: Message, state: FSMContext):
+    network = (message.text or "").strip()
+    if not network or len(network) > 40:
+        await message.answer("❌ Название сети 1–40 символов:")
+        return
+    await state.update_data(network=network)
+    await state.set_state(AddWallet.waiting_address)
+    await message.answer("👛 Теперь введи адрес кошелька:")
+
+
+@admin_router.message(AddWallet.waiting_address)
+async def wallet_add_address(message: Message, state: FSMContext):
+    address = (message.text or "").strip()
+    if not (10 <= len(address) <= 200):
+        await message.answer("❌ Странный адрес. Попробуй снова:")
+        return
+    data = await state.get_data()
+    await state.clear()
+    await add_wallet(data["network"], address, message.from_user.id)
+    await message.answer(f"✅ Добавлено:\n<b>{data['network']}</b>\n<code>{address}</code>", reply_markup=back_to_admin_kb())
+
+
+@admin_router.callback_query(F.data.startswith("admin:wallet:del:"))
+async def wallet_delete(call: CallbackQuery):
+    wid = int(call.data.split(":")[3])
+    await delete_wallet(wid)
+    wallets = await get_wallets()
+    await call.message.edit_text("🗑 Удалено.\n\n💼 <b>Кошельки</b>:", reply_markup=admin_wallets_kb(wallets))
+
+
+# -------- заявки на вывод --------
+@admin_router.callback_query(F.data == "admin:withdrawals")
+async def admin_withdrawals(call: CallbackQuery):
+    items = await get_pending_withdrawals()
+    if not items:
+        await call.message.edit_text("📤 <b>Заявки на вывод</b>\n\nНет активных заявок.", reply_markup=back_to_admin_kb())
+        return
+    await call.message.edit_text(f"📤 <b>Заявки на вывод</b> ({len(items)})\n\nВыбери заявку:", reply_markup=admin_withdrawals_kb(items))
+
+
+@admin_router.callback_query(F.data.startswith("admin:wd:"))
+async def admin_withdrawal_view(call: CallbackQuery):
+    wid = int(call.data.split(":")[2])
+    w = await get_withdrawal(wid)
+    if not w:
+        await call.answer("Заявка не найдена", show_alert=True)
+        return
+    text = (
+        f"📤 <b>Заявка #{w['id']}</b>\n\n👤 Клиент: <code>{w['login']}</code>\n"
+        f"🌐 Сеть: <b>{w['network']}</b>\n👛 Кошелёк: <code>{w['wallet']}</code>\n"
+        f"💵 Сумма: <b>${w['amount']}</b>\n📅 Создано: {w['created_at']}\n📊 Статус: <b>{w['status']}</b>"
+    )
+    await call.message.edit_text(text, reply_markup=withdrawal_review_kb(wid))
+
+
+@admin_router.callback_query(F.data.startswith("wd:accept:"))
+async def withdrawal_accept(call: CallbackQuery, bot: Bot):
+    wid = int(call.data.split(":")[2])
+    w = await get_withdrawal(wid)
+    if not w or w["status"] != "pending":
+        await call.answer("Заявка уже обработана", show_alert=True)
+        return
+
+    user = await get_user(w["tg_id"])
+    if not user or user["crystals"] < w["amount"]:
+        await call.answer("❌ У клиента не хватает средств", show_alert=True)
+        return
+
+    await add_crystals(w["tg_id"], -w["amount"])
+    await finish_withdrawal(wid, "accepted")
+
+    try:
+        await bot.send_message(w["tg_id"], f"✅ <b>Заявка #{wid} принята</b>\n\n💵 Списано: <b>${w['amount']}</b>\n👛 Кошелёк: <code>{w['wallet']}</code>",)
     except Exception:
         pass
 
-    try:
-        await client.sign_in(password=password)
-    except Exception as e:
-        await update.effective_message.reply_text(
-            f"❌ Неверный пароль или ошибка: {type(e).__name__}\n"
-            "Попробуй /login заново."
-        )
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-        context.user_data.pop("awaiting_2fa", None)
+    await call.message.edit_text(f"✅ Заявка #{wid} принята, средства списаны.", reply_markup=back_to_admin_kb())
+
+
+@admin_router.callback_query(F.data.startswith("wd:reject:"))
+async def withdrawal_reject(call: CallbackQuery, bot: Bot):
+    wid = int(call.data.split(":")[2])
+    w = await get_withdrawal(wid)
+    if not w or w["status"] != "pending":
+        await call.answer("Заявка уже обработана", show_alert=True)
         return
 
-    await manager.add_new_client(user_id, client)
-    context.user_data.pop("awaiting_2fa", None)
-    await update.effective_message.reply_text(
-        "✅ Пароль принят. Аккаунт подключён! Можешь отправлять ссылку "
-        "или /send для рассылки."
-    )
-
-
-# ============================================================
-# ПАРСИНГ КАНАЛА (ОБРАБОТЧИК)
-# ============================================================
-
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    manager: ClientManager = context.bot_data["client_manager"]
-
-    if user_id in processing_users:
-        await update.effective_message.reply_text("Твой предыдущий запрос ещё обрабатывается.")
-        return
-
-    state = active_mailings.get(user_id)
-    if state and not state["task"].done():
-        await update.effective_message.reply_text(
-            "Сейчас идёт рассылка. Дождись окончания или /stop."
-        )
-        return
-
-    client = await manager.get_client(user_id)
-    if not client:
-        await update.effective_message.reply_text(
-            "Сначала авторизуйся: отправь /login и отсканируй QR-код."
-        )
-        return
-
-    username = parse_public_link(update.effective_message.text or "")
-    if not username:
-        await update.effective_message.reply_text(
-            "Не удалось распознать ссылку.\n"
-            "Пример: https://t.me/channelname\n"
-            "Или используй /send для рассылки."
-        )
-        return
-
-    processing_users.add(user_id)
-    status = await update.effective_message.reply_text(
-        f"Подключаюсь к @{username} и проверяю доступ..."
-    )
+    await finish_withdrawal(wid, "rejected")
 
     try:
-        entity = await client.get_entity(username)
-        await status.edit_text(
-            f"Анализирую сообщения и доступные комментарии @{username}..."
-        )
-
-        usernames, messages_count, comments_count = await collect_from_chat(
-            client, entity, status
-        )
-
-        if not usernames:
-            await status.edit_text(
-                "Публичные username авторов не найдены. "
-                "Возможно, авторы скрыты или у них нет username."
-            )
-            return
-
-        txt = io.BytesIO(("\n".join(usernames) + "\n").encode("utf-8"))
-        txt.name = "usernames.txt"
-        await update.effective_message.reply_document(
-            document=InputFile(txt, filename="usernames.txt"),
-            caption=f"TXT: {len(usernames)} уникальных username",
-        )
-
-        csv_text = "username\r\n" + "".join(name + "\r\n" for name in usernames)
-        csv_file = io.BytesIO(("\ufeff" + csv_text).encode("utf-8"))
-        csv_file.name = "usernames.csv"
-        await update.effective_message.reply_document(
-            document=InputFile(csv_file, filename="usernames.csv"),
-            caption=f"CSV: {len(usernames)} уникальных username",
-        )
-
-        await status.edit_text(
-            f"Готово!\n"
-            f"Уникальных username: {len(usernames)}\n"
-            f"Проверено сообщений: {messages_count}\n"
-            f"Проверено комментариев: {comments_count}\n\n"
-            "Повторы удалены. Выгрузка содержит только публичные username авторов."
-        )
-
-    except ValueError as error:
-        await status.edit_text(f"Не удалось открыть чат: {error}")
+        await bot.send_message(w["tg_id"], f"❌ <b>Заявка #{wid} отклонена</b>\n\n💵 Сумма не списана: <b>${w['amount']}</b>\nСвяжись с поддержкой: @tradingbot2027",)
     except Exception:
-        log.exception("Ошибка при обработке ссылки")
-        await status.edit_text(
-            "Не удалось обработать ссылку. Проверь, что твой аккаунт имеет доступ "
-            "к этому публичному чату/каналу."
-        )
-    finally:
-        processing_users.discard(user_id)
+        pass
+
+    await call.message.edit_text(f"❌ Заявка #{wid} отклонена.", reply_markup=back_to_admin_kb())
 
 
-# ============================================================
-# РАССЫЛКА СООБЩЕНИЙ
-# ============================================================
+# -------- Отмена любого состояния --------
+@admin_router.message(Command("cancel"))
+async def cancel_any_admin(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Действие отменено.", reply_markup=admin_menu_kb())
 
-async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    manager: ClientManager = context.bot_data["client_manager"]
-
-    client = await manager.get_client(user_id)
-    if not client:
-        await update.message.reply_text(
-            "Сначала авторизуйся: /login и отсканируй QR-код."
-        )
-        return
-
-    state = active_mailings.get(user_id)
-    if state and not state["task"].done():
-        await update.message.reply_text("У тебя уже идёт рассылка. /stop чтобы остановить.")
-        return
-
-    for k in ("mailing_text", "mailing_recipients",
-              "awaiting_recipients", "awaiting_confirm", "awaiting_mailing_text"):
-        context.user_data.pop(k, None)
-    context.user_data["awaiting_mailing_text"] = True
-
-    await update.message.reply_text(
-        "✍️ Пришли текст сообщения, которое нужно разослать.\n\n"
-        "Отмена — /cancel."
-    )
+@client_router.message(Command("cancel"))
+async def cancel_any_client(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Действие отменено.", reply_markup=client_menu_kb())
 
 
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for k in ("awaiting_mailing_text", "mailing_text", "mailing_recipients",
-              "awaiting_recipients", "awaiting_confirm"):
-        context.user_data.pop(k, None)
-    await update.message.reply_text("Ок, отменено.")
+@client_router.message(Command("admin"))
+async def no_access(message: Message):
+    await message.answer("⛔ У тебя нет доступа к админ-панели.")
 
 
-async def confirm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    recipients = context.user_data.get("mailing_recipients")
-    text = context.user_data.get("mailing_text")
-
-    if not recipients or not text:
-        await update.message.reply_text("Нет подготовленной рассылки. Начни с /send.")
-        return
-    if not context.user_data.get("awaiting_confirm"):
-        await update.message.reply_text("Сначала пришли список получателей после /send.")
-        return
-
-    context.user_data.pop("awaiting_confirm", None)
-    manager: ClientManager = context.bot_data["client_manager"]
-    client = await manager.get_client(user_id)
-    if not client:
-        await update.message.reply_text("Сессия потеряна. /login заново.")
-        return
-
-    # Сохраняем состояние
-    active_mailings[user_id] = {
-        "task": None,
-        "stop": False,
-        "sent": 0,
-        "failed": 0,
-        "total": len(recipients),
-        "text": text,
-        "recipients": recipients,
-        "current_idx": 0,
-        "paused": False
-    }
-
-    task = asyncio.create_task(
-        run_mailing(context, user_id, update.effective_chat.id, client, text, recipients, 0)
-    )
-    active_mailings[user_id]["task"] = task
-
-    await update.message.reply_text(
-        f"🚀 Старт рассылки на {len(recipients)} получателей.\n"
-        f"Интервал: {SEND_DELAY_SECONDS} сек. Остановить — /stop."
-    )
-
-
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = active_mailings.get(user_id)
-    if not state or state["task"].done():
-        await update.message.reply_text("Активной рассылки нет.")
-        return
-    state["stop"] = True
-    await update.message.reply_text("⏹ Останавливаю после текущего сообщения...")
-
-
-async def resume_mailing_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
+# ==================== АВТО-РАССЫЛКА КАЖДЫЙ ЧАС ====================
+async def hourly_trading_loop(bot: Bot):
+    # Ждем 10 секунд при старте, чтобы бот успел прогрузиться
+    await asyncio.sleep(10)
     
-    state = active_mailings.get(user_id)
-    if not state or not state.get("paused"):
-        await query.edit_message_text("Нет приостановленной рассылки.")
-        return
-
-    await query.edit_message_text("▶️ Продолжаю рассылку...")
-    state["paused"] = False
-    
-    manager: ClientManager = context.bot_data["client_manager"]
-    client = await manager.get_client(user_id)
-    if not client:
-        await context.bot.send_message(query.message.chat_id, "Сессия потеряна. /login заново.")
-        active_mailings.pop(user_id, None)
-        return
-
-    task = asyncio.create_task(
-        run_mailing(context, user_id, query.message.chat_id, client, state["text"], state["recipients"], state["current_idx"])
-    )
-    state["task"] = task
-
-
-async def run_mailing(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: int,
-                      client: TelegramClient, text: str, recipients: list, start_idx: int = 0):
-    state = active_mailings.get(user_id)
-    if not state:
-        return
-
-    progress_msg = await context.bot.send_message(
-        chat_id, f"📤 Рассылка: {start_idx}/{state['total']}..."
-    )
-    last_edit = 0.0
-    failed_log = []
-
-    try:
-        for idx, username in enumerate(recipients[start_idx:], start=start_idx + 1):
-            if state.get("stop"):
-                break
-
-            state["current_idx"] = idx
-
+    while True:
+        logging.info("Запуск ежечасной торговой статистики...")
+        users = await get_users_with_balance()
+        
+        for u in users:
+            bal = u['crystals']
+            
+            # Генерируем случайные сделки (от 0.5% до 2.5%) для реалистичности
+            num_trades = random.randint(2, 4)
+            trades_text = ""
+            total_profit = 0.0
+            
+            coins = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
+            directions = ["Long", "Short"]
+            
+            for i in range(1, num_trades + 1):
+                percent = random.uniform(0.005, 0.025) # 0.5% - 2.5%
+                profit = round(bal * percent, 2)
+                total_profit += profit
+                
+                coin = random.choice(coins)
+                direction = random.choice(directions)
+                
+                trades_text += f"🔹 Сделка {i} ({coin} {direction}): <b>+${profit}</b> (+{round(percent*100, 1)}%)\n"
+            
+            total_profit = round(total_profit, 2)
+            now_time = datetime.now().strftime("%H:%M")
+            
+            text = (
+                f"⏰ <b>Ежечасный отчет по торговле ({now_time})</b>\n\n"
+                f"Наш бот успешно отработал сессию на фьючерсах.\n\n"
+                f"📊 <b>Результаты по вашему депозиту (${bal}):</b>\n"
+                f"{trades_text}\n"
+                f"💰 <b>Итого профит: +${total_profit}</b>\n\n"
+                f"💵 <b>Ваш баланс:</b> <b>${bal}</b>\n"
+                f"<i>(Средства уже учтены в вашем профиле)</i>"
+            )
+            
             try:
-                entity = await client.get_entity(username)
-                if not isinstance(entity, User):
-                    state["failed"] += 1
-                    failed_log.append(f"@{username} — не пользователь")
-                else:
-                    await client.send_message(entity, text)
-                    state["sent"] += 1
-            except FloodWaitError as e:
-                await context.bot.send_message(
-                    chat_id,
-                    f"⏳ Telegram ограничил отправку. Жду {e.seconds} сек..."
-                )
-                await asyncio.sleep(e.seconds)
-                try:
-                    entity = await client.get_entity(username)
-                    if isinstance(entity, User):
-                        await client.send_message(entity, text)
-                        state["sent"] += 1
-                    else:
-                        state["failed"] += 1
-                except Exception as e2:
-                    state["failed"] += 1
-                    failed_log.append(f"@{username} — {type(e2).__name__}")
-            except (UsernameNotOccupiedError, UsernameInvalidError):
-                state["failed"] += 1
-                failed_log.append(f"@{username} — юзернейм не существует")
-            except UserPrivacyRestrictedError:
-                state["failed"] += 1
-                failed_log.append(f"@{username} — приватность")
-            except UserIsBlockedError:
-                state["failed"] += 1
-                failed_log.append(f"@{username} — заблокировал тебя")
-            except InputUserDeactivatedError:
-                state["failed"] += 1
-                failed_log.append(f"@{username} — аккаунт удалён")
-            except PeerFloodError:
-                # Ловим спам-блок
-                state["paused"] = True
-                keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Продолжить рассылку", callback_data="resume_mailing")]])
-                await context.bot.send_message(
-                    chat_id,
-                    "⚠️ **Telegram выдал спам-блок!**\n\n"
-                    "Зайди в @SpamBot, нажми Start, выбери кнопку **'This was a mistake'** (или подожди), "
-                    "сними ограничение. Затем нажми кнопку ниже, чтобы продолжить.",
-                    reply_markup=keyboard,
-                    parse_mode="Markdown"
-                )
-                return # Выходим, сохраняя состояние в active_mailings
+                await bot.send_message(u['tg_id'], text)
             except Exception as e:
-                state["failed"] += 1
-                failed_log.append(f"@{username} — {type(e).__name__}: {e}")
-                log.exception("Ошибка отправки @%s", username)
-
-            now = time.monotonic()
-            if now - last_edit >= 3 or idx == state["total"] or state.get("stop"):
-                last_edit = now
-                try:
-                    await progress_msg.edit_text(
-                        f"📤 Рассылка: {idx}/{state['total']}\n"
-                        f"✅ Отправлено: {state['sent']}\n"
-                        f"❌ Ошибок: {state['failed']}"
-                    )
-                except Exception:
-                    pass
-
-            if idx < state["total"] and not state.get("stop"):
-                await asyncio.sleep(SEND_DELAY_SECONDS)
-
-        summary = (
-            f"{'⏹ Остановлено' if state.get('stop') else '✅ Готово'}.\n"
-            f"Отправлено: {state['sent']}\n"
-            f"Ошибок: {state['failed']}\n"
-            f"Всего: {state['total']}"
-        )
-        if failed_log:
-            summary += "\n\nПервые ошибки:\n" + "\n".join(failed_log[:20])
-        await context.bot.send_message(chat_id, summary)
-    except Exception:
-        log.exception("Ошибка в run_mailing")
-        try:
-            await context.bot.send_message(
-                chat_id, "❌ Рассылка прервана из-за ошибки. Смотри логи."
-            )
-        except Exception:
-            pass
-    finally:
-        # Удаляем из активных только если это не пауза (спам-блок)
-        if not state.get("paused"):
-            active_mailings.pop(user_id, None)
+                logging.error(f"Ошибка отправки hourly trade report {u['tg_id']}: {e}")
+            
+            await asyncio.sleep(0.1) # Задержка чтобы не забанили за флуд
+            
+        logging.info(f"Ежечасный отчет разослан {len(users)} клиентам.")
+        
+        # Спим 1 час (3600 секунд)
+        await asyncio.sleep(3600)
 
 
-# ============================================================
-# ЕДИНЫЙ ДИСПЕТЧЕР ТЕКСТОВЫХ СООБЩЕНИЙ
-# ============================================================
+# ==================== LAUNCH ====================
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    await init_db()
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1) ждём пароль 2FA
-    if context.user_data.get("awaiting_2fa"):
-        await handle_2fa_password(update, context)
-        return
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
 
-    # 2) ждём текст для рассылки
-    if context.user_data.get("awaiting_mailing_text"):
-        text = (update.message.text or "").strip()
-        if not text:
-            await update.message.reply_text("Текст пустой. Пришли сообщение или /cancel.")
-            return
-        if len(text) > 4096:
-            await update.message.reply_text("Слишком длинно (макс. 4096 символов).")
-            return
-        context.user_data.pop("awaiting_mailing_text", None)
-        context.user_data["mailing_text"] = text
-        context.user_data["awaiting_recipients"] = True
-        await update.message.reply_text(
-            "✅ Текст сохранён.\n\n"
-            "Теперь пришли список юзернеймов — по одному в строке, "
-            "или через запятую/пробел. Можно с @ или без.\n"
-            f"Максимум: {MAX_RECIPIENTS_PER_RUN}.\n\n"
-            "Отмена — /cancel."
-        )
-        return
+    dp.include_router(common_router)
+    dp.include_router(admin_router)
+    dp.include_router(client_router)
 
-    # 3) ждём получателей
-    if context.user_data.get("awaiting_recipients"):
-        raw = update.message.text or ""
-        valid, invalid = parse_recipients(raw)
-        if not valid:
-            await update.message.reply_text(
-                "Не нашёл валидных юзернеймов. "
-                "Пример: @durov или durov (5–32 символа, A-Z, 0-9, _)."
-            )
-            return
-        truncated = False
-        if len(valid) > MAX_RECIPIENTS_PER_RUN:
-            valid = valid[:MAX_RECIPIENTS_PER_RUN]
-            truncated = True
+    # Запускаем фоновую задачу для рассылки каждый час
+    asyncio.create_task(hourly_trading_loop(bot))
 
-        context.user_data.pop("awaiting_recipients", None)
-        context.user_data["mailing_recipients"] = valid
-        context.user_data["awaiting_confirm"] = True
-
-        preview = "\n".join("@" + u for u in valid[:10])
-        more = "" if len(valid) <= 10 else f"\n... и ещё {len(valid) - 10}"
-        warn = ""
-        if invalid:
-            warn = f"\n\n⚠️ Пропущено невалидных: {len(invalid)} ({', '.join(invalid[:5])})"
-        if truncated:
-            warn += f"\n⚠️ Обрезано до {MAX_RECIPIENTS_PER_RUN}."
-        await update.message.reply_text(
-            f"Готово к рассылке.\n"
-            f"Получателей: {len(valid)}\n"
-            f"Интервал: {SEND_DELAY_SECONDS} сек\n"
-            f"Примерное время: ~{len(valid) * SEND_DELAY_SECONDS // 60} мин\n\n"
-            f"{preview}{more}{warn}\n\n"
-            f"Текст:\n---\n{context.user_data['mailing_text'][:500]}\n---\n\n"
-            f"Подтверди: /confirm\nОтмена: /cancel"
-        )
-        return
-
-    # 4) иначе — пробуем как ссылку на канал
-    await handle_link(update, context)
-
-
-# ============================================================
-# ЗАПУСК
-# ============================================================
-
-async def on_shutdown(app: Application):
-    manager: ClientManager = app.bot_data.get("client_manager")
-    if manager:
-        await manager.disconnect_all()
-
-
-def main():
-    if (
-        not BOT_TOKEN
-        or BOT_TOKEN.startswith("ВСТАВЬ")
-        or not API_HASH
-        or API_HASH.startswith("ВСТАВЬ")
-        or API_ID == 12345678
-    ):
-        raise RuntimeError("Сначала заполни BOT_TOKEN, API_ID, API_HASH в начале bot.py.")
-
-    manager = ClientManager(API_ID, API_HASH)
-
-    # Прокси убран из HTTPXRequest
-    request = HTTPXRequest(connect_timeout=30, read_timeout=30)
-    get_updates_request = HTTPXRequest(connect_timeout=30, read_timeout=30)
-
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .request(request)
-        .get_updates_request(get_updates_request)
-        .build()
-    )
-    
-    app.bot_data["client_manager"] = manager
-    app.post_shutdown = on_shutdown
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("login", login_command))
-    app.add_handler(CommandHandler("logout", logout_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("send", send_command))
-    app.add_handler(CommandHandler("confirm", confirm_command))
-    app.add_handler(CommandHandler("stop", stop_command))
-    app.add_handler(CommandHandler("cancel", cancel_command))
-
-    # Добавляем обработчик кнопки "Продолжить"
-    app.add_handler(CallbackQueryHandler(resume_mailing_callback, pattern="^resume_mailing$"))
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    print("Бот запущен. Нажми Ctrl+C для остановки.")
-    app.run_polling()
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("Бот запущен ✅")
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("Остановка бота...")
+    asyncio.run(main())
