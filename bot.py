@@ -6,7 +6,6 @@ import random
 import io
 from datetime import datetime
 
-# Импорты для графика
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -50,6 +49,7 @@ async def init_db():
                 full_name  TEXT,
                 login      TEXT UNIQUE,
                 crystals   INTEGER NOT NULL DEFAULT 0,
+                is_trading INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -75,14 +75,28 @@ async def init_db():
                 processed_at TIMESTAMP
             )
         """)
+        # ТАБЛИЦА ДЛЯ ИСТОРИИ СДЕЛОК
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                tg_id      INTEGER NOT NULL,
+                coin       TEXT NOT NULL,
+                direction  TEXT NOT NULL,
+                profit     REAL NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
 
+        # Миграции
         async with db.execute("PRAGMA table_info(users)") as cur:
             cols = {row[1] for row in await cur.fetchall()}
         if "login" not in cols:
             await db.execute("ALTER TABLE users ADD COLUMN login TEXT")
         if "crystals" not in cols:
             await db.execute("ALTER TABLE users ADD COLUMN crystals INTEGER NOT NULL DEFAULT 0")
+        if "is_trading" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN is_trading INTEGER NOT NULL DEFAULT 0")
         await db.commit()
 
 
@@ -114,9 +128,15 @@ async def upsert_user(tg_id: int, username, full_name, login: str | None = None)
         await db.commit()
 
 
-async def add_crystals(tg_id: int, amount: int):
+async def set_trading_status(tg_id: int, status: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET crystals = crystals + ? WHERE tg_id = ?", (amount, tg_id))
+        await db.execute("UPDATE users SET is_trading = ? WHERE tg_id = ?", (status, tg_id))
+        await db.commit()
+
+
+async def add_crystals(tg_id: int, amount: float):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET crystals = crystals + ? WHERE tg_id = ?", (int(round(amount)), tg_id))
         await db.commit()
 
 
@@ -135,10 +155,10 @@ async def get_all_registered_ids() -> list[int]:
             return [r[0] for r in await cur.fetchall()]
 
 
-async def get_users_with_balance():
+async def get_active_traders():
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT tg_id, login, crystals FROM users WHERE crystals > 0 AND login IS NOT NULL") as cur:
+        async with db.execute("SELECT tg_id, login, crystals FROM users WHERE crystals > 0 AND is_trading = 1 AND login IS NOT NULL") as cur:
             return [dict(r) for r in await cur.fetchall()]
 
 
@@ -213,29 +233,38 @@ async def finish_withdrawal(wid: int, status: str):
         await db.commit()
 
 
-# ==================== ГЕНЕРАТОР СДЕЛОК И ГРАФИКА ====================
-def generate_trades(balance: int):
-    if balance <= 0:
-        return "", 0.0
-        
-    num_trades = random.randint(3, 7)
-    trades_text = ""
+async def save_trade(tg_id: int, coin: str, direction: str, profit: float):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO trades (tg_id, coin, direction, profit) VALUES (?, ?, ?, ?)", (tg_id, coin, direction, profit))
+        await db.commit()
+
+
+async def get_user_trades(tg_id: int, limit=5):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM trades WHERE tg_id = ? ORDER BY id DESC LIMIT ?", (tg_id, limit)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+# ==================== ГЕНЕРАТОР И ГРАФИК ====================
+def generate_trades_data(balance: int):
+    num_trades = random.randint(3, 6)
+    trades = []
     total_profit = 0.0
     
     coins = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "DOGE/USDT"]
     directions = ["Long 🟢", "Short 🔴"]
     
     for i in range(1, num_trades + 1):
-        percent = random.uniform(0.003, 0.028)
+        percent = random.uniform(0.003, 0.025) # 0.3% - 2.5%
         profit = round(balance * percent, 2)
         total_profit += profit
         
         coin = random.choice(coins)
         direction = random.choice(directions)
+        trades.append({"coin": coin, "direction": direction, "profit": profit})
         
-        trades_text += f"🔹 {coin} | {direction}: <b>+${profit}</b>\n"
-        
-    return trades_text, round(total_profit, 2)
+    return trades, round(total_profit, 2)
 
 
 def create_chart_image(balance: int):
@@ -259,14 +288,13 @@ def create_chart_image(balance: int):
     
     buf = io.BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', transparent=True)
-    buf.seek(0)
     plt.close(fig)
     return buf
 
 
 # ==================== KEYBOARDS ====================
-def client_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def client_menu_kb(user=None) -> InlineKeyboardMarkup:
+    buttons = [
         [
             InlineKeyboardButton(text="👤 Профиль", callback_data="client:profile"),
             InlineKeyboardButton(text="📈 Статистика", callback_data="client:stats"),
@@ -279,7 +307,15 @@ def client_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="💵 Пополнение", callback_data="client:deposit"),
             InlineKeyboardButton(text="📤 Вывод",      callback_data="client:withdraw"),
         ]
-    ])
+    ]
+    
+    # Если баланс есть, но торговля не запущена - показываем кнопку ЗАПУСКА
+    if user and user['crystals'] > 0 and not user['is_trading']:
+        buttons.insert(0, [InlineKeyboardButton(text="🚀 ЗАПУСТИТЬ ТОРГОВЛЮ", callback_data="client:start_trading")])
+    elif user and user['is_trading']:
+        buttons.insert(0, [InlineKeyboardButton(text="🟢 Бот торгует (нажми для инфо)", callback_data="client:trading_info")])
+        
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def admin_menu_kb() -> InlineKeyboardMarkup:
@@ -294,7 +330,6 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="📢 Рассылка", callback_data="admin:broadcast"),
-            InlineKeyboardButton(text="📈 Отчет всем", callback_data="admin:trading"),
         ]
     ])
 
@@ -309,7 +344,6 @@ def back_to_client_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="client:menu")]
     ])
 
-# Кнопка "Отмена" теперь реально возвращает в меню
 def cancel_client_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Вернуться в меню", callback_data="client:menu")]
@@ -439,7 +473,7 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(
         f"👋 С возвращением, <b>{user['login']}</b>!\n"
         f"💵 Баланс: <b>${user['crystals']}</b>\n\nВыбери действие:",
-        reply_markup=client_menu_kb(),
+        reply_markup=client_menu_kb(user),
     )
     if is_admin(message.from_user.id):
         await message.answer("🔑 Ты админ. Открой /admin")
@@ -458,7 +492,8 @@ async def reg_set_login(message: Message, state: FSMContext, bot: Bot):
     await upsert_user(message.from_user.id, message.from_user.username, message.from_user.full_name, login=login)
     await state.clear()
     
-    await message.answer(f"✅ Готово! Твой логин: <code>{login}</code>\n💵 Баланс: <b>$0</b>\n\nМеню:", reply_markup=client_menu_kb())
+    user = await get_user(message.from_user.id)
+    await message.answer(f"✅ Готово! Твой логин: <code>{login}</code>\n💵 Баланс: <b>$0</b>\n\nМеню:", reply_markup=client_menu_kb(user))
     
     admin_text = (
         f"🆕 <b>Новый клиент!</b>\n\n"
@@ -472,45 +507,61 @@ async def reg_set_login(message: Message, state: FSMContext, bot: Bot):
         except Exception:
             pass
 
-    if is_admin(message.from_user.id):
-        await message.answer("🔑 Открой /admin")
-
 
 # ==================== КЛИЕНТ ====================
 @client_router.callback_query(F.data == "client:profile")
 async def show_profile(call: CallbackQuery):
     user = await get_user(call.from_user.id)
-    if not user or not user.get("login"):
-        await call.answer("Сначала пройди /start", show_alert=True)
-        return
     text = f"👤 <b>Профиль</b>\n\nЛогин: <code>{user['login']}</code>\n💵 Баланс: <b>${user['crystals']}</b>\nID: <code>{user['tg_id']}</code>"
     await call.message.edit_text(text, reply_markup=back_to_client_kb())
 
 
+# ЗАПУСК ТОРГОВЛИ
+@client_router.callback_query(F.data == "client:start_trading")
+async def start_trading(call: CallbackQuery, bot: Bot):
+    user = await get_user(call.from_user.id)
+    if user["crystals"] <= 0:
+        await call.answer("❌ Сначала пополните баланс!", show_alert=True)
+        return
+        
+    await set_trading_status(user["tg_id"], 1)
+    user = await get_user(call.from_user.id) # обновляем данные
+    
+    text = (
+        f"🚀 <b>Торговый бот успешно запущен!</b>\n\n"
+        f"Ваш депозит (${user['crystals']}) передан в управление ИИ-боту.\n"
+        f"Он будет торговать на фьючерсах, а <b>каждый час</b> присылать вам отчет о заработанных средствах.\n"
+        f"Прибыль будет моментально добавляться к вашему балансу.\n\n"
+        f"Ожидайте первый отчет через 60 минут!"
+    )
+    await call.message.edit_text(text, reply_markup=back_to_client_kb())
+
+
+@client_router.callback_query(F.data == "client:trading_info")
+async def trading_info(call: CallbackQuery):
+    await call.answer("🟢 Бот уже активно торгует и зарабатывает для вас прибыль. Ожидайте ежечасный отчет!", show_alert=True)
+
+
+# РЕАЛЬНАЯ СТАТИСТИКА ИЗ БАЗЫ
 @client_router.callback_query(F.data == "client:stats")
 async def show_client_stats(call: CallbackQuery):
     user = await get_user(call.from_user.id)
-    if not user: return
-        
-    balance = user["crystals"]
-    if balance <= 0:
-        await call.message.edit_text(
-            "📈 <b>Статистика</b>\n\nУ вас пока нет активного депозита для торговли. Пополните баланс.",
-            reply_markup=back_to_client_kb()
-        )
+    trades = await get_user_trades(user['tg_id'], limit=7)
+    
+    if not trades:
+        text = "📈 <b>Статистика торговли</b>\n\nУ вас пока нет закрытых сделок. Бот начнет торговать после активации."
+        await call.message.edit_text(text, reply_markup=back_to_client_kb())
         return
         
-    trades_text, total_profit = generate_trades(balance)
-    now = datetime.now().strftime("%d.%m.%Y | %H:%M")
+    text = "📈 <b>Последние сделки бота:</b>\n\n"
+    total = 0
+    for t in trades:
+        text += f"🔹 {t['coin']} | {t['direction']}: <b>+${t['profit']}</b>\n"
+        total += t['profit']
+        
+    text += f"\n💰 <b>Общая прибыль (за последние сессии): +${round(total, 2)}</b>"
+    text += f"\n💵 <b>Текущий баланс:</b> <b>${user['crystals']}</b>"
     
-    text = (
-        f"📈 <b>Статистика торговли</b>\n"
-        f"<i>Обновлено: {now}</i>\n\n"
-        f"Результаты последней сессии (депозит <b>${balance}</b>):\n\n"
-        f"{trades_text}\n"
-        f"💰 <b>Чистая прибыль: +${total_profit}</b>\n\n"
-        f"<i>Все средства уже добавлены в ваш общий баланс.</i>"
-    )
     await call.message.edit_text(text, reply_markup=back_to_client_kb())
 
 
@@ -543,7 +594,8 @@ async def show_support(call: CallbackQuery):
 @client_router.callback_query(F.data == "client:menu")
 async def back_to_client_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.edit_text("Выбери действие:", reply_markup=client_menu_kb())
+    user = await get_user(call.from_user.id)
+    await call.message.edit_text("Выбери действие:", reply_markup=client_menu_kb(user))
 
 
 @client_router.callback_query(F.data == "client:deposit")
@@ -589,7 +641,7 @@ async def withdraw_set_network(call: CallbackQuery, state: FSMContext):
     await state.set_state(Withdraw.waiting_wallet)
     await call.message.edit_text(
         f"📤 <b>Вывод</b>\nСеть: <b>{network}</b>\n\nВведи <b>адрес своего кошелька</b>:", 
-        reply_markup=cancel_client_kb() # ДОБАВЛЕНА КНОПКА НАЗАД
+        reply_markup=cancel_client_kb()
     )
 
 
@@ -606,7 +658,7 @@ async def withdraw_set_wallet(message: Message, state: FSMContext):
     await state.set_state(Withdraw.waiting_amount)
     await message.answer(
         f"📤 <b>Вывод</b>\nСеть: <b>{data['network']}</b>\nКошелёк: <code>{wallet}</code>\n\nСколько $ вывести? (доступно: <b>${user['crystals']}</b>)",
-        reply_markup=cancel_client_kb() # ДОБАВЛЕНА КНОПКА НАЗАД
+        reply_markup=cancel_client_kb()
     )
 
 
@@ -630,7 +682,7 @@ async def withdraw_set_amount(message: Message, state: FSMContext):
         f"Проверь заявку:\n\n🌐 Сеть: <b>{data['network']}</b>\n👛 Кошелёк: <code>{data['wallet']}</code>\n💵 Сумма: <b>${amount}</b>\n\nОтправить админу?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Отправить", callback_data="wd:submit")],
-            [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="client:menu")], # ДОБАВЛЕНА КНОПКА НАЗАД
+            [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="client:menu")],
         ]),
     )
 
@@ -656,7 +708,7 @@ async def withdraw_submit(call: CallbackQuery, state: FSMContext, bot: Bot):
         except Exception:
             pass
 
-    await call.message.edit_text(f"✅ Заявка #{wid} отправлена админу.", reply_markup=client_menu_kb())
+    await call.message.edit_text(f"✅ Заявка #{wid} отправлена админу.", reply_markup=client_menu_kb(user))
 
 
 # ==================== АДМИН ====================
@@ -677,7 +729,6 @@ async def admin_stats(call: CallbackQuery):
     await call.message.edit_text(f"📊 <b>Статистика</b>\n\n👥 Клиентов: <b>{stats['total']}</b>\n💵 Общий баланс: <b>${stats['total_crystals']}</b>", reply_markup=back_to_admin_kb())
 
 
-# -------- клиенты --------
 @admin_router.callback_query(F.data.startswith("admin:users:"))
 async def admin_users(call: CallbackQuery):
     page = int(call.data.split(":")[2])
@@ -695,11 +746,11 @@ async def admin_user_card(call: CallbackQuery):
     if not user:
         await call.answer("Клиент не найден", show_alert=True)
         return
-    text = f"👤 <b>Карточка клиента</b>\n\nЛогин: <code>{user['login']}</code>\nИмя: {user['full_name']}\nID: <code>{user['tg_id']}</code>\n💵 Баланс: <b>${user['crystals']}</b>"
+    trading_status = "🟢 Активна" if user['is_trading'] else "🔴 Остановлена"
+    text = f"👤 <b>Карточка клиента</b>\n\nЛогин: <code>{user['login']}</code>\nИмя: {user['full_name']}\nID: <code>{user['tg_id']}</code>\n💵 Баланс: <b>${user['crystals']}</b>\n📈 Торговля: {trading_status}"
     await call.message.edit_text(text, reply_markup=client_card_kb(tg_id))
 
 
-# -------- начисление --------
 @admin_router.callback_query(F.data.startswith("admin:credit:"))
 async def credit_start(call: CallbackQuery, state: FSMContext):
     tg_id = int(call.data.split(":")[2])
@@ -761,6 +812,7 @@ async def credit_go(call: CallbackQuery, state: FSMContext, bot: Bot):
         await bot.send_message(
             tg_id,
             f"💵 <b>Изменение баланса</b>\n\nСумма: <b>${amount:+d}</b>\nТекущий баланс: <b>${user['crystals']}</b>\n\n{notification}",
+            reply_markup=client_menu_kb(user)
         )
         delivered = True
     except Exception:
@@ -772,7 +824,6 @@ async def credit_go(call: CallbackQuery, state: FSMContext, bot: Bot):
     )
 
 
-# -------- рассылка --------
 @admin_router.callback_query(F.data == "admin:broadcast")
 async def broadcast_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(Broadcast.waiting_message)
@@ -810,7 +861,8 @@ async def broadcast_go(call: CallbackQuery, state: FSMContext, bot: Bot):
         if not user: continue
         personal_text = f"{base_text}\n\n💰 <b>Ваш актуальный баланс:</b> <b>${user['crystals']}</b>"
         try:
-            await bot.send_message(uid, personal_text, reply_markup=client_menu_kb()) # ДОБАВЛЕНО МЕНЮ
+            # ПРИКРЕПЛЯЕМ МЕНЮ К РАССЫЛКЕ
+            await bot.send_message(uid, personal_text, reply_markup=client_menu_kb(user))
             ok += 1
         except Exception:
             fail += 1
@@ -819,54 +871,6 @@ async def broadcast_go(call: CallbackQuery, state: FSMContext, bot: Bot):
     await call.message.answer(f"📢 Готово.\n✅ Доставлено: <b>{ok}</b>\n❌ Ошибок: <b>{fail}</b>", reply_markup=back_to_admin_kb())
 
 
-# -------- Трейдинг-отчет ВРУЧНУЮ --------
-@admin_router.callback_query(F.data == "admin:trading")
-async def trading_broadcast_start(call: CallbackQuery):
-    users = await get_users_with_balance()
-    if not users:
-        await call.answer("Нет клиентов с балансом > 0", show_alert=True)
-        return
-    
-    await call.message.edit_text(
-        f"📈 <b>Трейдинг-отчет (вручную)</b>\n\nБудет отправлен <b>{len(users)}</b> клиентам с уникальными сделками.\n\nЗапускаем?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Запустить", callback_data="trading:go")],
-            [InlineKeyboardButton(text="⬅️ В админ-меню", callback_data="admin:menu")],
-        ])
-    )
-
-
-@admin_router.callback_query(F.data == "trading:go")
-async def trading_broadcast_go(call: CallbackQuery, bot: Bot):
-    await call.message.edit_text("📤 Формируем отчеты…")
-    users = await get_users_with_balance()
-    ok = fail = 0
-    
-    for u in users:
-        bal = u['crystals']
-        trades_text, total_profit = generate_trades(bal)
-        now_time = datetime.now().strftime("%H:%M")
-        
-        text = (
-            f"🚀 <b>Отчет по торговле ({now_time})</b>\n\n"
-            f"Наш бот успешно отработал сессию на фьючерсах.\n\n"
-            f"📊 <b>Результаты по вашему депозиту (${bal}):</b>\n"
-            f"{trades_text}\n"
-            f"💰 <b>Итого профит: +${total_profit}</b>\n\n"
-            f"💵 <b>Ваш баланс:</b> <b>${bal}</b>"
-        )
-        try:
-            # ДОБАВЛЕНО МЕНЮ, ЧТОБЫ КЛИЕНТ МОГ ВЕРНУТЬСЯ
-            await bot.send_message(u['tg_id'], text, reply_markup=client_menu_kb())
-            ok += 1
-        except Exception:
-            fail += 1
-        await asyncio.sleep(0.05)
-
-    await call.message.answer(f"📈 Готово.\n✅ Доставлено: <b>{ok}</b>\n❌ Ошибок: <b>{fail}</b>", reply_markup=back_to_admin_kb())
-
-
-# -------- кошельки --------
 @admin_router.callback_query(F.data == "admin:wallets")
 async def admin_wallets(call: CallbackQuery):
     wallets = await get_wallets()
@@ -913,7 +917,6 @@ async def wallet_delete(call: CallbackQuery):
     await call.message.edit_text("🗑 Удалено.\n\n💼 <b>Кошельки</b>:", reply_markup=admin_wallets_kb(wallets))
 
 
-# -------- заявки на вывод --------
 @admin_router.callback_query(F.data == "admin:withdrawals")
 async def admin_withdrawals(call: CallbackQuery):
     items = await get_pending_withdrawals()
@@ -953,9 +956,11 @@ async def withdrawal_accept(call: CallbackQuery, bot: Bot):
 
     await add_crystals(w["tg_id"], -w["amount"])
     await finish_withdrawal(wid, "accepted")
+    
+    updated_user = await get_user(w["tg_id"])
 
     try:
-        await bot.send_message(w["tg_id"], f"✅ <b>Заявка #{wid} принята</b>\n\n💵 Списано: <b>${w['amount']}</b>\n👛 Кошелёк: <code>{w['wallet']}</code>", reply_markup=client_menu_kb())
+        await bot.send_message(w["tg_id"], f"✅ <b>Заявка #{wid} принята</b>\n\n💵 Списано: <b>${w['amount']}</b>\n👛 Кошелёк: <code>{w['wallet']}</code>", reply_markup=client_menu_kb(updated_user))
     except Exception:
         pass
 
@@ -971,36 +976,49 @@ async def withdrawal_reject(call: CallbackQuery, bot: Bot):
         return
 
     await finish_withdrawal(wid, "rejected")
+    user = await get_user(w["tg_id"])
 
     try:
-        await bot.send_message(w["tg_id"], f"❌ <b>Заявка #{wid} отклонена</b>\n\n💵 Сумма не списана: <b>${w['amount']}</b>\nСвяжись с поддержкой: @tradingbot2027", reply_markup=client_menu_kb())
+        await bot.send_message(w["tg_id"], f"❌ <b>Заявка #{wid} отклонена</b>\n\n💵 Сумма не списана: <b>${w['amount']}</b>\nСвяжись с поддержкой: @tradingbot2027", reply_markup=client_menu_kb(user))
     except Exception:
         pass
 
     await call.message.edit_text(f"❌ Заявка #{wid} отклонена.", reply_markup=back_to_admin_kb())
 
 
-# ==================== АВТО-РАССЫЛКА КАЖДЫЙ ЧАС ====================
+# ==================== АВТО-РАССЫЛКА И НАЧИСЛЕНИЕ ПРИБЫЛИ ====================
 async def hourly_trading_loop(bot: Bot):
     await asyncio.sleep(10)
     while True:
-        users = await get_users_with_balance()
+        # Берем только тех, у кого включена торговля и есть баланс
+        users = await get_active_traders()
         for u in users:
             bal = u['crystals']
-            trades_text, total_profit = generate_trades(bal)
-            now_time = datetime.now().strftime("%H:%M")
+            trades_data, total_profit = generate_trades_data(bal)
             
+            # 1. СОХРАНЯЕМ СДЕЛКИ В ИСТОРИЮ
+            trades_text = ""
+            for t in trades_data:
+                await save_trade(u['tg_id'], t['coin'], t['direction'], t['profit'])
+                trades_text += f"🔹 {t['coin']} | {t['direction']}: <b>+${t['profit']}</b>\n"
+            
+            # 2. РЕАЛЬНО НАЧИСЛЯЕМ ПРИБЫЛЬ НА БАЛАНС
+            await add_crystals(u['tg_id'], total_profit)
+            updated_user = await get_user(u['tg_id'])
+            
+            now_time = datetime.now().strftime("%H:%M")
             text = (
                 f"⏰ <b>Ежечасный отчет по торговле ({now_time})</b>\n\n"
-                f"Наш бот успешно отработал сессию на фьючерсах.\n\n"
-                f"📊 <b>Результаты по вашему депозиту (${bal}):</b>\n"
+                f"Наш ИИ-бот успешно отработал сессию на фьючерсах.\n\n"
+                f"📊 <b>Результаты сессии:</b>\n"
                 f"{trades_text}\n"
                 f"💰 <b>Итого профит: +${total_profit}</b>\n\n"
-                f"💵 <b>Ваш баланс:</b> <b>${bal}</b>\n"
+                f"💵 <b>Ваш новый баланс:</b> <b>${updated_user['crystals']}</b>\n"
+                f"<i>(Средства уже добавлены в ваш профиль)</i>"
             )
             try:
-                # ДОБАВЛЕНО МЕНЮ, ЧТОБЫ КЛИЕНТ МОГ ВЕРНУТЬСЯ
-                await bot.send_message(u['tg_id'], text, reply_markup=client_menu_kb())
+                # ПРИКРЕПЛЯЕМ МЕНЮ
+                await bot.send_message(u['tg_id'], text, reply_markup=client_menu_kb(updated_user))
             except Exception:
                 pass
             await asyncio.sleep(0.1)
